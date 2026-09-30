@@ -9,7 +9,7 @@ pub fn build() -> TokenStream {
     .unwrap();
 
     let mut java_constants = TokenStream::new();
-    let mut java_match_arms = TokenStream::new();
+    let mut java_key_entries = TokenStream::new();
     for (name, value) in &java_json {
         let ident = to_valid_ident(name);
         let ident_str = ident.to_string();
@@ -22,15 +22,15 @@ pub fn build() -> TokenStream {
             #doc
             pub const #ident: &str = #name;
         });
-        java_match_arms.extend(quote! {
-            #ident_str => Some(#ident),
+        java_key_entries.extend(quote! {
+            #ident_str => #ident,
         });
     }
 
     let bedrock_content =
         fs::read_to_string("../../assets/en_us_bedrock.lang").expect("en_us_bedrock is missing");
     let mut bedrock_constants = TokenStream::new();
-    let mut bedrock_match_arms = TokenStream::new();
+    let mut bedrock_key_entries = TokenStream::new();
 
     for line in bedrock_content.lines() {
         let line = line.trim();
@@ -53,20 +53,20 @@ pub fn build() -> TokenStream {
                 #doc
                 pub const #ident: &str = #name;
             });
-            bedrock_match_arms.extend(quote! {
-                #ident_str => Some(#ident),
+            bedrock_key_entries.extend(quote! {
+                #ident_str => #ident,
             });
         }
     }
 
-    let mut java_value_match_arms = TokenStream::new();
+    let mut java_value_entries = TokenStream::new();
     for (name, value) in &java_json {
-        java_value_match_arms.extend(quote! {
-            #name => Some(#value),
+        java_value_entries.extend(quote! {
+            #name => #value,
         });
     }
 
-    let mut bedrock_value_match_arms = TokenStream::new();
+    let mut bedrock_value_entries = TokenStream::new();
     for line in bedrock_content.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with('/') {
@@ -76,8 +76,8 @@ pub fn build() -> TokenStream {
         if let Some((name, value)) = line.split_once('=') {
             let name = name.trim();
             let value = value.trim();
-            bedrock_value_match_arms.extend(quote! {
-                #name => Some(#value),
+            bedrock_value_entries.extend(quote! {
+                #name => #value,
             });
         }
     }
@@ -87,32 +87,32 @@ pub fn build() -> TokenStream {
         #![allow(clippy::doc_markdown)]
         pub mod java {
             #java_constants
+            static KEYS: phf::Map<&'static str, &'static str> = phf::phf_map! {
+                #java_key_entries
+            };
+            static VALUES: phf::Map<&'static str, &'static str> = phf::phf_map! {
+                #java_value_entries
+            };
             pub fn get(const_name: &str) -> Option<&'static str> {
-                match const_name {
-                    #java_match_arms
-                    _ => None,
-                }
+                KEYS.get(const_name).copied()
             }
             pub fn get_value(key: &str) -> Option<&'static str> {
-                match key {
-                    #java_value_match_arms
-                    _ => None,
-                }
+                VALUES.get(key).copied()
             }
         }
         pub mod bedrock {
             #bedrock_constants
+            static KEYS: phf::Map<&'static str, &'static str> = phf::phf_map! {
+                #bedrock_key_entries
+            };
+            static VALUES: phf::Map<&'static str, &'static str> = phf::phf_map! {
+                #bedrock_value_entries
+            };
             pub fn get(const_name: &str) -> Option<&'static str> {
-                match const_name {
-                    #bedrock_match_arms
-                    _ => None,
-                }
+                KEYS.get(const_name).copied()
             }
             pub fn get_value(key: &str) -> Option<&'static str> {
-                match key {
-                    #bedrock_value_match_arms
-                    _ => None,
-                }
+                VALUES.get(key).copied()
             }
         }
     }
