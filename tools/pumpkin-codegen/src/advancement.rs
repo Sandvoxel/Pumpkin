@@ -777,7 +777,7 @@ impl ToTokens for AdvancementTree {
         let nodes = self.nodes.iter().map(|(k, v)| {
             let key = identifier_to_tokens(k);
             quote! {
-                nodes.insert(#key, #v);
+                nodes.insert(const { #key }, #v);
             }
         });
         let nodes_vector = &self.nodes_vector;
@@ -1003,7 +1003,7 @@ pub(crate) fn build() -> TokenStream {
             }
 
             pub const fn get_identifier_list() -> [Identifier;#capacity] {
-                [#minecraft_namespaces]
+                const { [#minecraft_namespaces] }
             }
 
             pub const fn is_root(&self) -> bool{
