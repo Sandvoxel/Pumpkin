@@ -1,0 +1,5 @@
+name: Bounded build with durable telemetry
+description: Verify telemetry and artifact round trip before one measured build
+runs:
+  using: node24
+  main: main.mjs

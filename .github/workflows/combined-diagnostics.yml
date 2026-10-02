@@ -1,0 +1,26 @@
+name: Combined executor and packet confirmation
+
+on:
+  push:
+    branches:
+      - codex/combined-plugin-runners-20261002
+
+permissions:
+  contents: read
+
+concurrency:
+  group: combined-plugin-runners-20261002
+  cancel-in-progress: false
+
+jobs:
+  baseline:
+    if: github.repository == 'Sandvoxel/Pumpkin'
+    uses: ./.github/workflows/combined-diagnostic-build.yml
+    with:
+      variant: baseline
+  candidate:
+    needs: baseline
+    if: github.repository == 'Sandvoxel/Pumpkin'
+    uses: ./.github/workflows/combined-diagnostic-build.yml
+    with:
+      variant: candidate
