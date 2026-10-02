@@ -11,8 +11,9 @@ import sys
 import threading
 import time
 
-OUT = Path("diagnostic-output")
-OUT.mkdir(exist_ok=True)
+PROBE = sys.argv[1:] == ["--probe"]
+OUT = Path("diagnostic-output") / ("probe" if PROBE else "")
+OUT.mkdir(parents=True, exist_ok=True)
 CLOCK_TICKS = os.sysconf("SC_CLK_TCK")
 PAGE_BYTES = os.sysconf("SC_PAGE_SIZE")
 
@@ -117,6 +118,17 @@ def processes(root_pid):
     return result
 
 
+def kernel_oom_lines():
+    try:
+        result = subprocess.run(["sudo", "-n", "dmesg", "--color=never"],
+                                capture_output=True, text=True, timeout=3)
+        return {"readable": result.returncode == 0,
+                "lines": [line for line in result.stdout.splitlines()
+                          if re.search(r"Out of memory:|oom-kill:|Killed process \d+", line)][-20:]}
+    except (OSError, subprocess.TimeoutExpired):
+        return {"readable": False, "lines": []}
+
+
 def main():
     started = time.monotonic()
     samples = (OUT / "telemetry.jsonl").open("w", buffering=1)
@@ -127,10 +139,18 @@ def main():
         text = json.dumps(record, sort_keys=True)
         samples.write(text + "\n")
         if live:
-            print("DIAGNOSTIC " + text, flush=True)
-    emit("before", system_sample())
+            compact = {k: v for k, v in record.items() if k not in {"cgroups", "cpu_stat"}}
+            compact["cgroups"] = {p: {k: v for k, v in values.items() if k in {
+                "memory.current", "memory.peak", "memory.events", "memory.swap.current"}}
+                for p, values in record.get("cgroups", {}).items()}
+            print("DIAGNOSTIC " + json.dumps(compact, sort_keys=True), flush=True)
+    before = system_sample()
+    emit("before", {**before, "kernel_oom": kernel_oom_lines()})
     command = ["/usr/bin/time", "-v", "-o", str(OUT / "time.txt"),
                "cargo", "build", "--verbose", "--release", "--target", "aarch64-unknown-linux-musl"]
+    if PROBE:
+        command = command[:4] + [sys.executable, "-c",
+                   "import time; b=bytearray(32*1024*1024); sum(range(3000000)); time.sleep(2)"]
     child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                              start_new_session=True)
     def copy_output():
@@ -138,12 +158,10 @@ def main():
             for line in iter(child.stdout.readline, b""):
                 log.write(line)
                 log.flush()
-                sys.stdout.buffer.write(line)
-                sys.stdout.buffer.flush()
     copier = threading.Thread(target=copy_output, daemon=True)
     copier.start()
     def interrupted(signum, _frame):
-        emit("received_signal", {"signal": signum, **system_sample()})
+        emit("received_signal", {"signal": signum, **system_sample(), "kernel_oom": kernel_oom_lines()})
         try:
             os.killpg(child.pid, signum)
         except ProcessLookupError:
@@ -157,6 +175,8 @@ def main():
         rows = processes(child.pid)
         current = {(r["pid"], r["start_ticks"]) for r in rows}
         aggregate = sum(r["rss_bytes"] for r in rows)
+        build_pids = {r["pid"] for r in rows}
+        helpers = [r for r in processes(os.getppid()) if r["pid"] not in build_pids]
         maximum_aggregate = max(maximum_aggregate, aggregate)
         for row in rows:
             key = f'{row["pid"]}:{row["start_ticks"]}'
@@ -164,9 +184,18 @@ def main():
             peaks[key] = {**row, "peak_rss_bytes": max(row["rss_bytes"], previous["peak_rss_bytes"] if previous else 0),
                           "first_seen_seconds": previous["first_seen_seconds"] if previous else round(time.monotonic() - started, 3),
                           "last_seen_seconds": round(time.monotonic() - started, 3)}
+        current_system = system_sample()
         emit("sample", {"processes": rows, "aggregate_rss_bytes": aggregate,
-                        "processes_ended": sorted(seen - current), **system_sample()},
-             live=tick % 15 == 0 or current != seen)
+                        "instrumentation_processes": helpers,
+                        "processes_ended": sorted(seen - current), **current_system},
+             live=tick % 10 == 0 or current != seen)
+        snapshot = {"elapsed_seconds": round(time.monotonic() - started, 3),
+                    "maximum_sampled_aggregate_rss_bytes": maximum_aggregate,
+                    "process_peaks": list(peaks.values()), "before": before,
+                    "current": current_system, "instrumentation_processes": helpers}
+        pending = OUT / "snapshot.pending"
+        pending.write_text(json.dumps(snapshot) + "\n")
+        pending.replace(OUT / "snapshot.json")
         seen = current
         tick += 1
         if child.poll() is not None:
@@ -177,7 +206,7 @@ def main():
               "process_peaks": list(peaks.values()), "sample_interval_seconds": 1,
               "elapsed_seconds": round(time.monotonic() - started, 3)}
     (OUT / "result.json").write_text(json.dumps(result, indent=2) + "\n")
-    emit("after", {"exit_code": child.returncode, **system_sample()})
+    emit("after", {"exit_code": child.returncode, **system_sample(), "kernel_oom": kernel_oom_lines()})
     print(read(OUT / "time.txt"), flush=True)
     samples.close()
     return child.returncode if child.returncode >= 0 else 128 - child.returncode

@@ -1,0 +1,91 @@
+name: One bounded ARM64 ThinLTO diagnostic build
+
+on:
+  workflow_call:
+    inputs:
+      variant:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-Dwarnings"
+  RUSTUP_TOOLCHAIN: "1.99.0"
+  CARGO_PROFILE_RELEASE_LTO: thin
+
+jobs:
+  build:
+    name: ARM64 musl ThinLTO (${{ inputs.variant }})
+    if: github.repository == 'Sandvoxel/Pumpkin' && (inputs.variant == 'baseline' || inputs.variant == 'prototype')
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 120
+    env:
+      VARIANT: ${{ inputs.variant }}
+    steps:
+      - name: Check out isolated diagnostics commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Verify and select exact production source
+        env:
+          VARIANT: ${{ inputs.variant }}
+        run: |
+          export CARGO_HOME="$RUNNER_TEMP/diagnostic-cargo-home"
+          printf 'CARGO_HOME=%s\n' "$CARGO_HOME" >> "$GITHUB_ENV"
+          mkdir diagnostic-output
+          git merge-base --is-ancestor 1859221e7ad1227f43277f74507f921c0acec83f HEAD
+          git diff --exit-code 1859221e7ad1227f43277f74507f921c0acec83f -- . ':(exclude).github'
+          echo 'e2afc394af1eb0e0bbcabb718adbb1c1cf8acc89e32655aa64697d907f3d5b5e  .github/diagnostics/executor-prototype.patch' | sha256sum --check
+          if [ "$VARIANT" = prototype ]; then
+            git apply --check .github/diagnostics/executor-prototype.patch
+            git apply .github/diagnostics/executor-prototype.patch
+          fi
+          {
+            printf 'variant=%s\n' "$VARIANT"
+            printf 'diagnostic_commit=%s\n' "$(git rev-parse HEAD)"
+            printf 'baseline_commit=1859221e7ad1227f43277f74507f921c0acec83f\n'
+            git diff --numstat
+            sha256sum Cargo.lock Cargo.toml crates/pumpkin-plugin-runtime/src/executor.rs
+            printf 'ImageOS=%s\nImageVersion=%s\n' "$ImageOS" "$ImageVersion"
+            printf 'CARGO_BUILD_JOBS=%s\n' "${CARGO_BUILD_JOBS-unset}"
+            printf 'CARGO_PROFILE_RELEASE_LTO=%s\n' "$CARGO_PROFILE_RELEASE_LTO"
+            nproc
+            lscpu
+            uname -a
+            free -b
+            df -B1 .
+          } | tee diagnostic-output/source-and-machine.txt
+          test ! -e target
+          test ! -e "$CARGO_HOME"
+          test -z "${CARGO_BUILD_JOBS-}"
+          test "$CARGO_PROFILE_RELEASE_LTO" = thin
+
+      - name: Install exact original compiler and musl tools
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal --target aarch64-unknown-linux-musl
+          rustup default 1.99.0
+          rustc -vV | tee diagnostic-output/rustc.txt
+          cargo -vV | tee diagnostic-output/cargo.txt
+          rustc -vV | grep -q '^release: 1.99.0$'
+          rustc -vV | grep -q '^commit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4$'
+          rustup show active-toolchain | tee diagnostic-output/active-toolchain.txt
+          rustup target list --installed | tee diagnostic-output/installed-targets.txt
+          test -n "$(find "$(rustc --print target-libdir --target aarch64-unknown-linux-musl)" -name 'libcore-*.rlib' -print -quit)"
+          sudo apt-get update
+          sudo apt-get install -y musl-tools time
+          dpkg-query -W musl musl-dev musl-tools time | tee diagnostic-output/packages.txt
+
+      - name: Install locked official artifact library
+        working-directory: .github/diagnostics/checkpoint-build
+        env:
+          npm_config_cache: ${{ runner.temp }}/diagnostic-npm-cache
+        run: npm ci --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org
+
+      - name: Verify telemetry round trip, build, and preserve evidence
+        uses: ./.github/diagnostics/checkpoint-build
