@@ -1,0 +1,20 @@
+name: Advancement candidate fat LTO memory check
+
+on:
+  push:
+    branches:
+      - codex/advancement-fat-runner-20261002
+
+permissions:
+  contents: read
+
+concurrency:
+  group: advancement-fat-runner-20261002
+  cancel-in-progress: false
+
+jobs:
+  candidate:
+    if: github.repository == 'Sandvoxel/Pumpkin'
+    uses: ./.github/workflows/advancement-fat-build.yml
+    with:
+      variant: candidate
