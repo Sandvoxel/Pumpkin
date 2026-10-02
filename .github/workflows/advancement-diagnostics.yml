@@ -1,4 +1,4 @@
-name: Advancement const initialization comparison
+name: Advancement const initialization reverse comparison
 
 on:
   push:
@@ -13,14 +13,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  baseline:
-    if: github.repository == 'Sandvoxel/Pumpkin'
-    uses: ./.github/workflows/advancement-diagnostic-build.yml
-    with:
-      variant: baseline
   candidate:
-    needs: baseline
     if: github.repository == 'Sandvoxel/Pumpkin'
     uses: ./.github/workflows/advancement-diagnostic-build.yml
     with:
       variant: candidate
+  baseline:
+    needs: candidate
+    if: github.repository == 'Sandvoxel/Pumpkin'
+    uses: ./.github/workflows/advancement-diagnostic-build.yml
+    with:
+      variant: baseline

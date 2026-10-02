@@ -28,6 +28,7 @@ jobs:
       - name: Check out isolated diagnostics commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: 0f0577213aafa5c40b80c1eb216dbaaeee3da79e
           fetch-depth: 0
           submodules: recursive
           persist-credentials: false
@@ -50,6 +51,7 @@ jobs:
           {
             printf 'variant=%s\n' "$VARIANT"
             printf 'diagnostic_commit=%s\n' "$(git rev-parse HEAD)"
+            printf 'workflow_commit=%s\n' "$GITHUB_SHA"
             printf 'source_commit=%s\n' "$source"
             git diff --numstat
             sha256sum Cargo.lock Cargo.toml crates/pumpkin-data/src/generated/advancement.rs tools/pumpkin-codegen/src/advancement.rs
