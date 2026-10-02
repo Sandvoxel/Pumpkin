@@ -147,7 +147,7 @@ def main():
     before = system_sample()
     emit("before", {**before, "kernel_oom": kernel_oom_lines()})
     command = ["/usr/bin/time", "-v", "-o", str(OUT / "time.txt"),
-               "cargo", "build", "--verbose", "--release", "--target", "aarch64-unknown-linux-musl"]
+               "cargo", "build", "--verbose", "--release", "--target", "aarch64-unknown-linux-musl", "--timings"]
     if PROBE:
         command = command[:4] + [sys.executable, "-c",
                    "import time; b=bytearray(32*1024*1024); sum(range(3000000)); time.sleep(2)"]

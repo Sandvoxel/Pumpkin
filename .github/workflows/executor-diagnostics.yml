@@ -1,4 +1,4 @@
-name: ARM64 executor diagnostics
+name: ARM64 baseline compiler profile
 
 on:
   push:
@@ -18,10 +18,3 @@ jobs:
     uses: ./.github/workflows/executor-diagnostic-build.yml
     with:
       variant: baseline
-
-  prototype:
-    needs: baseline
-    if: github.repository == 'Sandvoxel/Pumpkin'
-    uses: ./.github/workflows/executor-diagnostic-build.yml
-    with:
-      variant: prototype

@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
+import { readFile, writeFile, mkdir, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -20,11 +21,17 @@ for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => {
   monitor?.kill(signal);
 });
 
+async function hashFile(file) {
+  const hash = createHash('sha256');
+  for await (const chunk of createReadStream(file)) hash.update(chunk);
+  return hash.digest('hex');
+}
+
 async function saveState() {
   await writeFile('diagnostic-output/checkpoint-state.json', JSON.stringify(state, null, 2) + '\n');
 }
 
-function run(command, args, { visible = false, timeout = 90000, measured = false } = {}) {
+function run(command, args, { visible = false, timeout = 300000, measured = false } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { stdio: visible ? 'inherit' : ['ignore', 'pipe', 'pipe'] });
     if (measured) monitor = child;
@@ -49,10 +56,10 @@ async function checkpoint(label, kind, verify) {
   const packed = await run('python3', [path.join(here, 'bundle.py'), kind, file, String(telemetryOffset)]);
   if (packed.code !== 0) throw new Error(`Could not prepare bounded ${label} archive`);
   const bundle = JSON.parse(packed.output);
-  const sha256 = createHash('sha256').update(await readFile(file)).digest('hex');
+  const sha256 = await hashFile(file);
   const requestPath = path.join(scratch, `${label}-request.json`);
   const resultPath = path.join(scratch, `${label}-result.json`);
-  const request = { name: `${variant}-thin-${runId}-${attempt}-${label}`, file,
+  const request = { name: `${variant}-profile-${runId}-${attempt}-${label}`, file,
     result: resultPath, download: path.join(scratch, `${label}-download`), verify, sha256 };
   await writeFile(requestPath, JSON.stringify(request));
   const uploaded = await run(process.execPath, [path.join(here, 'upload.mjs'), requestPath]);
@@ -66,6 +73,17 @@ async function checkpoint(label, kind, verify) {
   if (kind === 'periodic') telemetryOffset = bundle.telemetry_end;
   await saveState();
   console.log(`CHECKPOINT ${JSON.stringify(record)}`);
+}
+
+const uploadedProfiles = new Set();
+async function completedProfiles() {
+  const profileRoot = 'diagnostic-output/profiles';
+  for (const name of await readdir(profileRoot)) {
+    if (!/^(pumpkin|pumpkin_wasm_host_v0_[12])-[0-9]+$/.test(name) || uploadedProfiles.has(name)) continue;
+    try { await readFile(path.join(profileRoot, name, 'result.json')); } catch { continue; }
+    await checkpoint(`trace-${name}`, `profile:${name}`, false);
+    uploadedProfiles.add(name);
+  }
 }
 
 function waitUntilOrExit(deadline, finished) {
@@ -100,9 +118,9 @@ try {
   const started = Date.now();
   const finished = run('python3', [path.join(here, '..', 'monitor.py')],
     { visible: true, timeout: 0, measured: true });
-  for (const minute of [5, 10, 15, 20, 25, 35, 60, 90]) {
+  for (const minute of [5, 10, 15, 25, 45]) {
     if (await waitUntilOrExit(started + minute * 60000, finished)) break;
-    try { await checkpoint(`minute-${minute}`, 'periodic', false); }
+    try { await checkpoint(`minute-${minute}`, 'periodic', false); await completedProfiles(); }
     catch {
       state.failures.push({ checkpoint_minute: minute, utc: new Date().toISOString() });
       await saveState();
@@ -126,6 +144,7 @@ try {
     line.includes('-C lto=thin') && line.includes('-C codegen-units=1') &&
     line.includes('--target aarch64-unknown-linux-musl'));
   await saveState();
+  await completedProfiles();
   await checkpoint('final', 'final', true);
   const success = build.code === 0 && footprint.code === 0 && state.final_rustc_thin_cgu1_verified &&
     Object.values(state.oom_kill_deltas).every(delta => delta === 0) && !interrupted;

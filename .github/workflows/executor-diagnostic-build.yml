@@ -1,4 +1,4 @@
-name: One bounded ARM64 ThinLTO diagnostic build
+name: One bounded baseline compiler profile
 
 on:
   workflow_call:
@@ -19,9 +19,9 @@ env:
 jobs:
   build:
     name: ARM64 musl ThinLTO (${{ inputs.variant }})
-    if: github.repository == 'Sandvoxel/Pumpkin' && (inputs.variant == 'baseline' || inputs.variant == 'prototype')
+    if: github.repository == 'Sandvoxel/Pumpkin' && inputs.variant == 'baseline'
     runs-on: ubuntu-26.04-arm
-    timeout-minutes: 120
+    timeout-minutes: 90
     env:
       VARIANT: ${{ inputs.variant }}
     steps:
@@ -42,10 +42,7 @@ jobs:
           git merge-base --is-ancestor 1859221e7ad1227f43277f74507f921c0acec83f HEAD
           git diff --exit-code 1859221e7ad1227f43277f74507f921c0acec83f -- . ':(exclude).github'
           echo 'e2afc394af1eb0e0bbcabb718adbb1c1cf8acc89e32655aa64697d907f3d5b5e  .github/diagnostics/executor-prototype.patch' | sha256sum --check
-          if [ "$VARIANT" = prototype ]; then
-            git apply --check .github/diagnostics/executor-prototype.patch
-            git apply .github/diagnostics/executor-prototype.patch
-          fi
+          test "$VARIANT" = baseline
           {
             printf 'variant=%s\n' "$VARIANT"
             printf 'diagnostic_commit=%s\n' "$(git rev-parse HEAD)"
@@ -80,6 +77,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools time
           dpkg-query -W musl musl-dev musl-tools time | tee diagnostic-output/packages.txt
+
+      - name: Validate compiler profiling before full build
+        run: |
+          chmod +x .github/diagnostics/profile-rustc.py
+          python3 .github/diagnostics/profile-rustc.py --probe
+          printf 'RUSTC_WRAPPER=%s/.github/diagnostics/profile-rustc.py\n' "$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
 
       - name: Install locked official artifact library
         working-directory: .github/diagnostics/checkpoint-build
