@@ -21,6 +21,7 @@ members = [
     "crates/pumpkin-util",
     "crates/pumpkin-wasm-host",
     "crates/pumpkin-wasm-host-common",
+    "crates/pumpkin-wasm-host-packets",
     "crates/pumpkin-wasm-host-v0_1",
     "crates/pumpkin-wasm-host-v0_2",
     "crates/pumpkin-world",
@@ -144,6 +145,9 @@ codegen-units = 16
 [profile.release.package.pumpkin-wasm-host-common]
 codegen-units = 16
 
+[profile.release.package.pumpkin-wasm-host-packets]
+codegen-units = 16
+
 [profile.release.package.pumpkin-wasm-host-v0_1]
 codegen-units = 16
 
@@ -227,6 +231,7 @@ pumpkin-protocol = { path = "crates/pumpkin-protocol", default-features = false 
 pumpkin-util = { path = "crates/pumpkin-util", default-features = false }
 pumpkin-wasm-host = { path = "crates/pumpkin-wasm-host", default-features = false }
 pumpkin-wasm-host-common = { path = "crates/pumpkin-wasm-host-common", default-features = false }
+pumpkin-wasm-host-packets = { path = "crates/pumpkin-wasm-host-packets" }
 pumpkin-wasm-host-v0_1 = { path = "crates/pumpkin-wasm-host-v0_1", default-features = false }
 pumpkin-wasm-host-v0_2 = { path = "crates/pumpkin-wasm-host-v0_2", default-features = false }
 pumpkin-world = { path = "crates/pumpkin-world", default-features = false }

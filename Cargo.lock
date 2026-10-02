@@ -3710,6 +3710,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pumpkin-wasm-host-packets"
+version = "0.2.0+26.3-26.51"
+dependencies = [
+ "bytes",
+ "pumpkin-core",
+ "pumpkin-protocol",
+ "pumpkin-util",
+ "serde_json",
+ "uuid",
+ "wasmtime",
+]
+
+[[package]]
 name = "pumpkin-wasm-host-v0_1"
 version = "0.2.0+26.3-26.51"
 dependencies = [
@@ -3723,6 +3736,7 @@ dependencies = [
  "pumpkin-protocol",
  "pumpkin-util",
  "pumpkin-wasm-host-common",
+ "pumpkin-wasm-host-packets",
  "pumpkin-world",
  "rand",
  "serde_json",
@@ -3748,6 +3762,7 @@ dependencies = [
  "pumpkin-protocol",
  "pumpkin-util",
  "pumpkin-wasm-host-common",
+ "pumpkin-wasm-host-packets",
  "pumpkin-world",
  "rand",
  "serde_json",

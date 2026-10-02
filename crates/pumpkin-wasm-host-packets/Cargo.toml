@@ -1,0 +1,22 @@
+[package]
+name = "pumpkin-wasm-host-packets"
+version.workspace = true
+description = "Shared packet values and conversions for matching Wasm API schemas."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+pumpkin-core.workspace = true
+pumpkin-protocol = { workspace = true, features = ["default"] }
+pumpkin-util.workspace = true
+bytes.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+wasmtime.workspace = true
+
+[lints]
+workspace = true

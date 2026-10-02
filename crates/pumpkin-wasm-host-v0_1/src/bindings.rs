@@ -3,6 +3,10 @@ use wasmtime::component::bindgen;
 bindgen!({
     path: "../pumpkin-plugin-wit/v0.1",
     world: "plugin",
+    with: {
+        "pumpkin:plugin/java-packets@0.1.0": crate::packet_facade::java_packets,
+        "pumpkin:plugin/bedrock-packets@0.1.0": crate::packet_facade::bedrock_packets,
+    },
     imports: {
         "pumpkin:plugin/command@0.1.0.[method]command-sender.has-permission": async | store | trappable,
         "pumpkin:plugin/datapack@0.1.0.[method]datapack-manager.disable-pack": async | store | trappable,

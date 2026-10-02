@@ -24,7 +24,7 @@ use std::{
 };
 
 pub const WIT_OUT_DIR: &str = "../../crates/pumpkin-plugin-wit/v0.2";
-pub const MAPPING_OUT_DIR: &str = "../../crates/pumpkin-wasm-host-v0_2/src";
+pub const MAPPING_OUT_DIR: &str = "../../crates/pumpkin-wasm-host-packets/src";
 
 pub fn main() {
     fs::create_dir_all(WIT_OUT_DIR).expect("Failed to create WIT output directory");
@@ -62,7 +62,11 @@ pub fn main() {
     mapping = format_code(&mapping).unwrap_or(mapping);
 
     let mapping_path = Path::new(MAPPING_OUT_DIR).join("generated_packets.rs");
-    fs::write(&mapping_path, mapping).expect("Failed to write packet mapping");
+    let shared = fs::read_to_string(&mapping_path).expect("v0.1 packet mapping must exist");
+    assert_eq!(
+        shared, mapping,
+        "packet mappings diverged; split the shared implementation"
+    );
 }
 
 fn write_generated_wit(new_code: &str, out_file: &str) {

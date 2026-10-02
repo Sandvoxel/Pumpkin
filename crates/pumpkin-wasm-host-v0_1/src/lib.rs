@@ -12,6 +12,7 @@ use wasmtime::component::{HasSelf, InstancePre, Linker};
 use wasmtime::{Engine, Store};
 
 mod bindings;
+pub mod packet_facade;
 
 pub mod advancement;
 // wasmtime's `bindgen!` requires every Host trait method to be `async fn`, even the ones whose
@@ -36,7 +37,7 @@ pub mod enchantment;
 pub mod entity;
 pub mod events;
 pub mod forms;
-pub mod generated_packets;
+pub use pumpkin_wasm_host_packets::generated_packets;
 #[allow(clippy::unused_async_trait_impl)]
 pub mod gui;
 #[allow(clippy::unused_async_trait_impl)]
