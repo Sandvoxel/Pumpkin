@@ -15,6 +15,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-Dwarnings"
+  RUSTUP_TOOLCHAIN: "1.99.0"
 
 jobs:
   build:
@@ -42,7 +43,7 @@ jobs:
           export CARGO_HOME="$RUNNER_TEMP/diagnostic-cargo-home"
           printf 'CARGO_HOME=%s\n' "$CARGO_HOME" >> "$GITHUB_ENV"
           mkdir diagnostic-output
-          test "$(git rev-parse HEAD^)" = 1859221e7ad1227f43277f74507f921c0acec83f
+          git merge-base --is-ancestor 1859221e7ad1227f43277f74507f921c0acec83f HEAD
           git diff --exit-code 1859221e7ad1227f43277f74507f921c0acec83f -- . ':(exclude).github'
           echo 'e2afc394af1eb0e0bbcabb718adbb1c1cf8acc89e32655aa64697d907f3d5b5e  .github/diagnostics/executor-prototype.patch' | sha256sum --check
           if [ "$VARIANT" = prototype ]; then
@@ -74,7 +75,10 @@ jobs:
           rustc -vV | tee diagnostic-output/rustc.txt
           cargo -vV | tee diagnostic-output/cargo.txt
           rustc -vV | grep -q '^release: 1.99.0$'
-          rustc -vV | grep -q '^commit-hash: b940084d7'
+          rustc -vV | grep -q '^commit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4$'
+          rustup show active-toolchain | tee diagnostic-output/active-toolchain.txt
+          rustup target list --installed | tee diagnostic-output/installed-targets.txt
+          test -n "$(find "$(rustc --print target-libdir --target aarch64-unknown-linux-musl)" -name 'libcore-*.rlib' -print -quit)"
           sudo apt-get update
           sudo apt-get install -y musl-tools time
           dpkg-query -W musl musl-dev musl-tools time | tee diagnostic-output/packages.txt
