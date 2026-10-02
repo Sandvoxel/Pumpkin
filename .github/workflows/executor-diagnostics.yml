@@ -1,0 +1,109 @@
+name: ARM64 executor diagnostics
+
+on:
+  push:
+    branches:
+      - codex/arm64-executor-diagnostics-20261002
+
+permissions:
+  contents: read
+
+concurrency:
+  group: arm64-executor-diagnostics-20261002
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-Dwarnings"
+
+jobs:
+  build:
+    name: ARM64 musl fat LTO (${{ matrix.variant }})
+    if: github.repository == 'Sandvoxel/Pumpkin'
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        variant: [baseline, prototype]
+    steps:
+      - name: Check out isolated diagnostics commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Verify and select exact production source
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          export CARGO_HOME="$RUNNER_TEMP/diagnostic-cargo-home"
+          printf 'CARGO_HOME=%s\n' "$CARGO_HOME" >> "$GITHUB_ENV"
+          mkdir diagnostic-output
+          test "$(git rev-parse HEAD^)" = 1859221e7ad1227f43277f74507f921c0acec83f
+          git diff --exit-code 1859221e7ad1227f43277f74507f921c0acec83f -- . ':(exclude).github'
+          echo 'e2afc394af1eb0e0bbcabb718adbb1c1cf8acc89e32655aa64697d907f3d5b5e  .github/diagnostics/executor-prototype.patch' | sha256sum --check
+          if [ "$VARIANT" = prototype ]; then
+            git apply --check .github/diagnostics/executor-prototype.patch
+            git apply .github/diagnostics/executor-prototype.patch
+          fi
+          {
+            printf 'variant=%s\n' "$VARIANT"
+            printf 'diagnostic_commit=%s\n' "$(git rev-parse HEAD)"
+            printf 'baseline_commit=1859221e7ad1227f43277f74507f921c0acec83f\n'
+            git diff --numstat
+            sha256sum Cargo.lock Cargo.toml crates/pumpkin-plugin-runtime/src/executor.rs
+            printf 'ImageOS=%s\nImageVersion=%s\n' "$ImageOS" "$ImageVersion"
+            printf 'CARGO_BUILD_JOBS=%s\n' "${CARGO_BUILD_JOBS-unset}"
+            nproc
+            lscpu
+            uname -a
+            free -b
+            df -B1 .
+          } | tee diagnostic-output/source-and-machine.txt
+          test ! -e target
+          test ! -e "$CARGO_HOME"
+          test -z "${CARGO_BUILD_JOBS-}"
+
+      - name: Install exact original compiler and musl tools
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal --target aarch64-unknown-linux-musl
+          rustup default 1.99.0
+          rustc -vV | tee diagnostic-output/rustc.txt
+          cargo -vV | tee diagnostic-output/cargo.txt
+          rustc -vV | grep -q '^release: 1.99.0$'
+          rustc -vV | grep -q '^commit-hash: b940084d7'
+          sudo apt-get update
+          sudo apt-get install -y musl-tools time
+          dpkg-query -W musl musl-dev musl-tools time | tee diagnostic-output/packages.txt
+
+      - name: Build original workspace scope with live telemetry
+        run: python3 .github/diagnostics/monitor.py
+
+      - name: Record final source and artifact footprint
+        if: always()
+        run: |
+          mkdir -p diagnostic-output
+          {
+            git diff --exit-code HEAD -- Cargo.lock Cargo.toml
+            sha256sum Cargo.lock Cargo.toml crates/pumpkin-plugin-runtime/src/executor.rs
+            df -B1 .
+            du -sb target 2>/dev/null || true
+            find target -type f \( -name 'libpumpkin_wasm_host*.rlib' -o -name 'pumpkin' \) -printf '%s %p\n' 2>/dev/null | sort -nr || true
+            if [ -f target/aarch64-unknown-linux-musl/release/pumpkin ]; then
+              sha256sum target/aarch64-unknown-linux-musl/release/pumpkin
+              size -A target/aarch64-unknown-linux-musl/release/pumpkin
+            fi
+          } | tee diagnostic-output/final-footprint.txt
+
+      - name: Preserve diagnostic logs and telemetry
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: arm64-musl-${{ matrix.variant }}-${{ github.sha }}
+          path: diagnostic-output/
+          retention-days: 14
+          if-no-files-found: error
+          compression-level: 6
