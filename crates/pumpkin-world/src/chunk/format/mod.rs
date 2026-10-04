@@ -59,6 +59,13 @@ impl PathFromLevelFolder for ChunkData {
 }
 
 impl Dirtiable for ChunkData {
+    fn take_dirty(&self) -> bool {
+        self.dirty.swap(false, Ordering::AcqRel)
+    }
+    fn save_generation(&self) -> u64 {
+        self.save_generation.load(Ordering::Relaxed)
+    }
+
     #[inline]
     fn mark_dirty(&self, flag: bool) {
         self.dirty.store(flag, Ordering::Relaxed);
@@ -435,6 +442,7 @@ impl ChunkData {
             z: position.y,
             // This chunk is read from disk, so it has not been modified
             dirty: AtomicBool::new(false),
+            save_generation: std::sync::atomic::AtomicU64::new(0),
             block_ticks: ChunkTickScheduler::from_iter(block_ticks),
             fluid_ticks: ChunkTickScheduler::from_iter(fluid_ticks),
             pending_block_entities: std::sync::Mutex::new(block_entities),
@@ -722,6 +730,13 @@ impl PathFromLevelFolder for ChunkEntityData {
 }
 
 impl Dirtiable for ChunkEntityData {
+    fn take_dirty(&self) -> bool {
+        self.dirty.swap(false, Ordering::AcqRel)
+    }
+    fn save_generation(&self) -> u64 {
+        self.save_generation.load(Ordering::Relaxed)
+    }
+
     #[inline]
     fn mark_dirty(&self, flag: bool) {
         self.dirty.store(flag, Ordering::Relaxed);
@@ -809,6 +824,7 @@ impl ChunkEntityData {
             data: std::sync::Mutex::new(entities),
             live: AtomicBool::new(false),
             dirty: AtomicBool::new(false),
+            save_generation: std::sync::atomic::AtomicU64::new(0),
         })
     }
 

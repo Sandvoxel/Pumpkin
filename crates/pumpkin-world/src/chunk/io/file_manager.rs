@@ -10,7 +10,7 @@ use tokio::{
     join,
     sync::{OnceCell, RwLock, mpsc},
 };
-use tracing::{debug, error, trace};
+use tracing::trace;
 
 use crate::{
     chunk::{ChunkReadingError, ChunkWritingError, io::Dirtiable},
@@ -28,8 +28,7 @@ use super::{ChunkSerializer, FileIO, LoadedData};
 ///   All readers/writers for the same region file share this lock, so there
 ///   are never two concurrent writers for the same file.
 /// * `watchers` — a ref-count per path.  While a path has active watchers the
-///   serializer is **not** evicted from the cache and the file is **not**
-///   flushed to disk (the caller owns the flush lifecycle).
+///   serializer stays cached; save completion still commits its dirty records.
 ///
 /// ### Lock ordering (must never be violated to avoid deadlocks)
 ///
@@ -39,10 +38,15 @@ use super::{ChunkSerializer, FileIO, LoadedData};
 ///
 /// `watchers` is always acquired in its own critical section, after all
 /// serializer locks are released, which keeps it strictly independent.
+type PendingChunks<D> = BTreeMap<PathBuf, rustc_hash::FxHashMap<Vector2<i32>, (u64, Arc<D>)>>;
+
 pub struct ChunkFileManager<S: ChunkSerializer<WriteBackend = PathBuf>> {
     file_locks: RwLock<BTreeMap<PathBuf, Arc<ChunkSerializerLazyLoader<S>>>>,
     watchers: RwLock<BTreeMap<PathBuf, usize>>,
     chunk_config: S::ChunkConfig,
+    pending: std::sync::Mutex<PendingChunks<S::Data>>,
+    committed: std::sync::Mutex<rustc_hash::FxHashMap<(PathBuf, Vector2<i32>), u64>>,
+    touched: std::sync::Mutex<std::collections::BTreeSet<PathBuf>>,
 }
 
 pub(crate) trait PathFromLevelFolder {
@@ -106,6 +110,9 @@ impl<S: ChunkSerializer<WriteBackend = PathBuf>> ChunkFileManager<S> {
             file_locks: RwLock::new(BTreeMap::new()),
             watchers: RwLock::new(BTreeMap::new()),
             chunk_config,
+            pending: std::sync::Mutex::new(BTreeMap::new()),
+            committed: std::sync::Mutex::new(rustc_hash::FxHashMap::default()),
+            touched: std::sync::Mutex::new(std::collections::BTreeSet::new()),
         }
     }
 }
@@ -139,12 +146,79 @@ impl<S: ChunkSerializer<WriteBackend = PathBuf>> ChunkFileManager<S> {
         loader.get().await
     }
 
+    async fn commit_pending(
+        &self,
+        path: &PathBuf,
+        writer: &mut S,
+    ) -> Result<(), ChunkWritingError> {
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(path)
+            .cloned()
+            .unwrap_or_default();
+        let mut applied = rustc_hash::FxHashSet::default();
+        let mut first_error = None;
+        for (pos, (_, chunk)) in &pending {
+            chunk.take_dirty();
+            match writer.update_chunk(chunk.clone(), &self.chunk_config).await {
+                Ok(()) => {
+                    applied.insert(*pos);
+                }
+                Err(error) => {
+                    chunk.mark_dirty(true);
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        if let Err(error) = writer.write(path).await {
+            for (_, chunk) in pending.values() {
+                chunk.mark_dirty(true);
+            }
+            return Err(ChunkWritingError::IoError(error));
+        }
+        {
+            let mut committed = self
+                .committed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut all_pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(entries) = all_pending.get_mut(path) {
+                for pos in applied {
+                    if let Some((generation, _)) = entries.remove(&pos) {
+                        committed.insert((path.clone(), pos), generation);
+                    }
+                }
+                if entries.is_empty() {
+                    all_pending.remove(path);
+                }
+            }
+            self.touched
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(path.clone())
+        };
+        first_error.map_or(Ok(()), Err)
+    }
+
     /// Attempt to evict the cached serializer for `path`.
     ///
     /// The entry is only removed when *both* conditions hold:
     /// 1. No watcher still references the path.
     /// 2. No other `Arc` clone is live (ensured via `can_remove`).
     async fn maybe_evict(&self, path: &PathBuf) {
+        if self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(path)
+        {
+            return;
+        }
         // Check watchers independently of file_locks to honour lock ordering.
         let still_watched = {
             let watchers = self.watchers.read().await;
@@ -299,100 +373,124 @@ where
         folder: &'a LevelFolder,
         chunks_data: Vec<(Vector2<i32>, Self::Data)>,
     ) -> Result<(), ChunkWritingError> {
-        // Group chunks by region file.
-        let mut regions_chunks: BTreeMap<String, Vec<Self::Data>> = BTreeMap::new();
-        for (at, chunk) in chunks_data {
-            regions_chunks
-                .entry(S::get_chunk_key(&at))
-                .or_default()
-                .push(chunk);
+        let mut regions: BTreeMap<String, Vec<_>> = BTreeMap::new();
+        for (pos, chunk) in chunks_data {
+            if chunk.is_dirty() {
+                let generation = match chunk.save_generation() {
+                    0 => super::next_save_generation(),
+                    generation => generation,
+                };
+                regions
+                    .entry(S::get_chunk_key(&pos))
+                    .or_default()
+                    .push((pos, generation, chunk));
+            }
         }
-
-        let tasks = regions_chunks
-            .into_iter()
-            .map(|(file_name, chunk_locks)| async move {
-                let path = P::file_path(folder, &file_name);
-                trace!("Saving chunks into {}", path.display());
-
-                let chunk_serializer = match self.get_serializer(&path).await {
-                    Ok(s) => s,
-                    Err(ChunkReadingError::ChunkNotExist) => {
-                        return Err(ChunkWritingError::IoError(std::io::Error::other(
-                            "get_serializer returned ChunkNotExist",
-                        )));
-                    }
-                    Err(ChunkReadingError::IoError(err)) => {
-                        error!("I/O error reading region before write: {err}");
-                        return Err(ChunkWritingError::IoError(err));
-                    }
-                    Err(err) => {
-                        return Err(ChunkWritingError::IoError(std::io::Error::other(
-                            err.to_string(),
-                        )));
-                    }
-                };
-
-                {
-                    let mut writer = chunk_serializer.write().await;
-                    for chunk in &chunk_locks {
-                        // Atomically snapshot and clear the dirty flag before we
-                        // write so that any mutation that races in *during* this
-                        // serialisation round will mark dirty again correctly.
-                        let was_dirty = chunk.is_dirty();
-                        chunk.mark_dirty(false);
-
-                        if was_dirty {
-                            writer
-                                .update_chunk(chunk.clone(), &self.chunk_config)
-                                .await?;
-                        }
-                    }
-                    // Write-lock released here — flush can proceed under a read-lock.
-                }
-
-                trace!("Chunk data updated for {}", path.display());
-
-                // We check watchers *after* releasing the write-lock to honour
-                // lock ordering (serializer lock → watchers, never the reverse).
-                let is_watched = {
-                    let watchers = self.watchers.read().await;
-                    watchers.get(&path).is_some_and(|&c| c > 0)
-                };
-
-                if !is_watched {
-                    // A read-lock suffices for `write()` since we have already
-                    // applied all mutations above.
+        let tasks = regions.into_iter().map(|(name, chunks)| async move {
+            let path = P::file_path(folder, &name);
+            let serializer = self.get_serializer(&path).await.map_err(|error| {
+                ChunkWritingError::IoError(std::io::Error::other(error.to_string()))
+            })?;
+            let mut writer = serializer.write().await;
+            {
+                let committed = self
+                    .committed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut pending = self
+                    .pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let entries = pending.entry(path.clone()).or_default();
+                for (pos, generation, chunk) in chunks {
+                    if committed
+                        .get(&(path.clone(), pos))
+                        .is_some_and(|previous| *previous >= generation)
                     {
-                        let serializer = chunk_serializer.read().await;
-                        debug!("Flushing {} to disk", path.display());
-                        serializer
-                            .write(&path)
-                            .await
-                            .map_err(ChunkWritingError::IoError)?;
-                        // Read-lock released here.
-                    };
-
-                    // Drop our handle so `can_remove` may succeed.
-                    drop(chunk_serializer);
-
-                    // Evict the cache entry when no longer needed.
-                    self.maybe_evict(&path).await;
+                        continue;
+                    }
+                    if entries
+                        .get(&pos)
+                        .is_none_or(|(previous, _)| *previous <= generation)
+                    {
+                        entries.insert(pos, (generation, chunk));
+                    }
                 }
-
-                Ok(())
-            });
-
-        // Collect all region results; surface the first error encountered.
-        let results: Vec<Result<(), ChunkWritingError>> = join_all(tasks).await;
-        results.into_iter().find(Result::is_err).unwrap_or(Ok(()))
+            }
+            let result = self.commit_pending(&path, &mut writer).await;
+            drop(writer);
+            drop(serializer);
+            if result.is_ok() {
+                self.maybe_evict(&path).await;
+            }
+            result
+        });
+        let mut first_error = None;
+        for result in join_all(tasks).await {
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
-    /// Blocks until all in-flight serialiser operations have completed by
-    /// acquiring (and immediately releasing) a write-lock on every cached
-    /// serialiser.
-    ///
-    /// This is a linearisation point: after this future resolves no mutation
-    /// started before the call is still running.
+    async fn flush(&self, synchronize: bool) -> Result<(), ChunkWritingError> {
+        let mut first_error = None;
+        let loaders: Vec<_> = self.file_locks.read().await.values().cloned().collect();
+        for loader in loaders {
+            match loader.get().await {
+                Ok(serializer) => {
+                    let mut writer = serializer.write().await;
+                    if let Err(error) = self.commit_pending(&loader.path, &mut writer).await {
+                        first_error.get_or_insert(error);
+                    }
+                }
+                Err(error) => {
+                    first_error.get_or_insert_with(|| {
+                        ChunkWritingError::IoError(std::io::Error::other(error.to_string()))
+                    });
+                }
+            }
+        }
+        if synchronize {
+            let paths: Vec<_> = self
+                .touched
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .cloned()
+                .collect();
+            for path in paths {
+                let result = async {
+                    let serializer = self.get_serializer(&path).await.map_err(|error| {
+                        ChunkWritingError::IoError(std::io::Error::other(error.to_string()))
+                    })?;
+                    serializer
+                        .read()
+                        .await
+                        .synchronize(&path)
+                        .await
+                        .map_err(ChunkWritingError::IoError)
+                }
+                .await;
+                match result {
+                    Ok(()) => {
+                        self.touched
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .remove(&path);
+                    }
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Wait for serializers currently present in the cache. Save request acknowledgements
+    /// and `flush` provide completion for queued writes.
     async fn block_and_await_ongoing_tasks(&self) {
         // Snapshot the current set of loaders under a read-lock so we do
         // not block new insertions longer than necessary.
@@ -463,6 +561,14 @@ where
         }
     }
 
+    async fn flush(&self, synchronize: bool) -> Result<(), ChunkWritingError> {
+        match self {
+            Self::Linear(io) => io.flush(synchronize).await,
+            Self::Anvil(io) => io.flush(synchronize).await,
+            Self::Pump(io) => io.flush(synchronize).await,
+        }
+    }
+
     async fn watch_chunks<'a>(&'a self, folder: &'a LevelFolder, chunks: &'a [Vector2<i32>]) {
         match self {
             Self::Linear(io) => io.watch_chunks(folder, chunks).await,
@@ -493,5 +599,159 @@ where
             Self::Anvil(io) => io.block_and_await_ongoing_tasks().await,
             Self::Pump(io) => io.block_and_await_ongoing_tasks().await,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chunk::{
+        ChunkSerializingError,
+        format::anvil::{AnvilChunkFile, SingleChunkDataSerializer},
+    };
+    use bytes::Bytes;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Record {
+        bytes: Bytes,
+        dirty: AtomicBool,
+        generation: u64,
+    }
+    impl Record {
+        fn new(bytes: Bytes, generation: u64) -> Arc<Self> {
+            Arc::new(Self {
+                bytes,
+                dirty: AtomicBool::new(true),
+                generation,
+            })
+        }
+    }
+    impl Dirtiable for Record {
+        fn is_dirty(&self) -> bool {
+            self.dirty.load(Ordering::Acquire)
+        }
+        fn mark_dirty(&self, flag: bool) {
+            self.dirty.store(flag, Ordering::Release);
+        }
+        fn take_dirty(&self) -> bool {
+            self.dirty.swap(false, Ordering::AcqRel)
+        }
+        fn save_generation(&self) -> u64 {
+            self.generation
+        }
+    }
+    impl PathFromLevelFolder for Record {
+        fn file_path(folder: &LevelFolder, name: &str) -> PathBuf {
+            folder.region_folder.join(name)
+        }
+    }
+    impl SingleChunkDataSerializer for Record {
+        fn position(&self) -> (i32, i32) {
+            (0, 0)
+        }
+        fn to_bytes(&self) -> Result<Bytes, ChunkSerializingError> {
+            Ok(self.bytes.clone())
+        }
+        fn from_bytes(bytes: &Bytes, _pos: Vector2<i32>) -> Result<Self, ChunkReadingError> {
+            Ok(Self {
+                bytes: bytes.clone(),
+                dirty: AtomicBool::new(false),
+                generation: 0,
+            })
+        }
+    }
+    fn folder(root: &Path) -> LevelFolder {
+        LevelFolder {
+            root_folder: root.into(),
+            dim_folder: root.into(),
+            region_folder: root.into(),
+            entities_folder: root.into(),
+            poi_folder: root.into(),
+        }
+    }
+    async fn read(
+        manager: &ChunkFileManager<AnvilChunkFile<Record>>,
+        folder: &LevelFolder,
+    ) -> Result<Bytes, Box<dyn std::error::Error>> {
+        let (tx, mut rx) = mpsc::channel(1);
+        manager
+            .fetch_chunks(folder, &[Vector2::new(0, 0)], tx)
+            .await;
+        match rx.recv().await {
+            Some(LoadedData::Loaded(record)) => Ok(record.bytes.clone()),
+            Some(LoadedData::Error((_, error))) => Err(error.into()),
+            _ => Err("Missing record".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn watched_saves_complete_and_stale_snapshots_cannot_overwrite()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let folder = folder(directory.path());
+        let manager = ChunkFileManager::<AnvilChunkFile<Record>>::new(
+            pumpkin_config::chunk::AnvilChunkConfig::default(),
+        );
+        let pos = Vector2::new(0, 0);
+        manager.watch_chunks(&folder, &[pos]).await;
+        manager
+            .save_chunks(
+                &folder,
+                vec![(pos, Record::new(Bytes::from_static(b"newer"), 2))],
+            )
+            .await?;
+        assert!(folder.region_folder.join("r.0.0.mca").exists());
+        manager
+            .save_chunks(
+                &folder,
+                vec![(pos, Record::new(Bytes::from_static(b"older"), 1))],
+            )
+            .await?;
+        manager.flush(true).await?;
+        assert_eq!(read(&manager, &folder).await?, Bytes::from_static(b"newer"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_save_retains_dirty_snapshot_for_flush_retry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let folder = folder(directory.path());
+        let manager = ChunkFileManager::<AnvilChunkFile<Record>>::new(
+            pumpkin_config::chunk::AnvilChunkConfig::default(),
+        );
+        let pos = Vector2::new(0, 0);
+        manager
+            .save_chunks(
+                &folder,
+                vec![(pos, Record::new(Bytes::from_static(b"original"), 1))],
+            )
+            .await?;
+        let original = std::fs::read(directory.path().join("r.0.0.mca"))?;
+        let mut state = 0x1234_5678u32;
+        let payload: Vec<_> = (0..1_140_725)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect();
+        let record = Record::new(payload.into(), 2);
+        let external = directory.path().join("c.0.0.mcc");
+        std::fs::create_dir(&external)?;
+        assert!(
+            manager
+                .save_chunks(&folder, vec![(pos, record.clone())])
+                .await
+                .is_err()
+        );
+        assert!(record.is_dirty());
+        assert_eq!(std::fs::read(directory.path().join("r.0.0.mca"))?, original);
+        manager.unwatch_chunks(&folder, &[pos]).await;
+        std::fs::remove_dir(&external)?;
+        manager.flush(true).await?;
+        assert_eq!(read(&manager, &folder).await?, record.bytes);
+        Ok(())
     }
 }

@@ -53,6 +53,18 @@ impl std::fmt::Display for GetBlockError {
 }
 
 pub trait WorldPortalExt: Send + Sync {
+    fn defer_ticket_release(
+        &self,
+        _pos: pumpkin_util::math::vector2::Vector2<i32>,
+        _level: i8,
+    ) -> bool {
+        false
+    }
+
+    fn prepare_chunk_unload(&self, _pos: pumpkin_util::math::vector2::Vector2<i32>) -> bool {
+        true
+    }
+
     fn can_place_at(
         &self,
         block: &Block,

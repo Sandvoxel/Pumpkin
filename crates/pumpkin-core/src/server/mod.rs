@@ -572,6 +572,14 @@ impl Server {
     }
 
     pub async fn save_all(&self) -> Result<(), String> {
+        self.save_all_with_mode(crate::world::saving::SaveMode::Manual)
+            .await
+    }
+
+    pub async fn save_all_with_mode(
+        &self,
+        mode: crate::world::saving::SaveMode,
+    ) -> Result<(), String> {
         if let Err(err) = self.save_world_info() {
             error!("Failed to save world info: {err}");
             return Err(format!("Failed to save world info: {err}"));
@@ -592,7 +600,7 @@ impl Server {
         }
 
         for world in self.worlds.load().iter() {
-            world.save().await;
+            world.save_with_mode(mode).await?;
         }
 
         Ok(())
@@ -734,6 +742,11 @@ impl Server {
     }
 
     pub async fn shutdown(&self) {
+        for world in self.worlds.load().iter() {
+            if let Err(error) = world.save_for_shutdown().await {
+                error!("Failed saving world during shutdown: {error}");
+            }
+        }
         self.tasks.close();
         debug!("Awaiting tasks for server");
         self.tasks.wait().await;

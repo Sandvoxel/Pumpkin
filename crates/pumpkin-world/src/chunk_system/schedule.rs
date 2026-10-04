@@ -3,7 +3,7 @@ use super::chunk_holder::ChunkHolder;
 use super::chunk_state::{Chunk, StagedChunkEnum};
 use super::dag::{DAG, EdgeKey, Node, NodeKey};
 use super::generation_cache::{Cache, SurfaceBiomeNeighborhood};
-use super::worker_logic::{RecvChunk, io_read_work, io_write_work};
+use super::worker_logic::{RecvChunk, WriteRequest, io_read_work, io_write_work};
 use super::{
     ChunkLevel, ChunkListener, ChunkLoading, ChunkPos, HashMapType, HashSetType, IOLock,
     LevelChannel,
@@ -66,17 +66,19 @@ pub struct GenerationSchedule {
     waiting_for_chunks: HashSetType<NodeKey>,
 
     io_lock: IOLock,
+    failed_loads: HashMapType<ChunkPos, String>,
     running_task_count: u16,
     max_in_flight: u16,
     queue_dirty: bool,
     recv_chunk: crossbeam::channel::Receiver<(ChunkPos, RecvChunk)>,
     io_read: tokio::sync::mpsc::Sender<Vec<ChunkPos>>,
-    io_write: tokio::sync::mpsc::Sender<Vec<(ChunkPos, Chunk)>>,
+    io_write: tokio::sync::mpsc::Sender<WriteRequest>,
     send_chunk: crossbeam::channel::Sender<(ChunkPos, RecvChunk)>,
     listener: Arc<ChunkListener>,
     lighting_config: LightingEngineConfig,
     last_unload: std::time::Instant,
     generation_pool: Arc<rayon::ThreadPool>,
+    level: std::sync::Weak<Level>,
 }
 
 impl GenerationSchedule {
@@ -159,6 +161,7 @@ impl GenerationSchedule {
                     unload_chunks: HashSetType::default(),
                     waiting_for_chunks: HashSetType::default(),
                     io_lock,
+                    failed_loads: HashMapType::default(),
                     running_task_count: 0,
                     max_in_flight,
                     queue_dirty: false,
@@ -171,6 +174,7 @@ impl GenerationSchedule {
                     lighting_config,
                     last_unload: std::time::Instant::now(),
                     generation_pool,
+                    level: Arc::downgrade(&level_sched),
                 };
                 scheduler.work(&level_sched);
             })
@@ -559,6 +563,10 @@ impl GenerationSchedule {
             let mut holder = self.chunk_map.remove(&pos).unwrap_or_default();
             debug_assert_eq!(holder.target_stage, old_stage);
             holder.target_stage = new_stage;
+            if self.failed_loads.contains_key(&pos) {
+                self.chunk_map.insert(pos, holder);
+                continue;
+            }
 
             // Effective target is what we actually need to schedule tasks up to.
             let effective_old = old_stage.max(holder.dependency_stage);
@@ -857,7 +865,17 @@ impl GenerationSchedule {
                 self.chunk_map.insert(pos, holder);
                 continue;
             }
-            if !holder.occupied.is_null() {
+            if !holder.occupied.is_null()
+                || (holder.public
+                    && self.level.upgrade().is_some_and(|level| {
+                        level
+                            .world_portal
+                            .load()
+                            .as_ref()
+                            .as_ref()
+                            .is_some_and(|portal| !portal.prepare_chunk_unload(pos))
+                    }))
+            {
                 self.chunk_map.insert(pos, holder);
                 self.unload_chunks.insert(pos);
                 continue;
@@ -886,7 +904,12 @@ impl GenerationSchedule {
                     Chunk::Level(chunk) => {
                         // Save chunk to disk if dirty
                         if chunk.is_dirty() {
-                            chunks.push((pos, Chunk::Level(chunk)));
+                            chunks.push((
+                                pos,
+                                Chunk::Level(Arc::new(
+                                    chunk.snapshot(crate::chunk::io::next_save_generation()),
+                                )),
+                            ));
                         }
                     }
                     Chunk::Proto(proto) => {
@@ -909,7 +932,7 @@ impl GenerationSchedule {
             *data.entry(*pos).or_insert(0) += 1;
         }
         drop(data);
-        if let Err(e) = self.io_write.blocking_send(chunks) {
+        if let Err(e) = self.io_write.blocking_send(WriteRequest::Chunks(chunks)) {
             error!(
                 "Failed to send chunks to io write thread during save (may have shut down): {:?}",
                 e
@@ -936,7 +959,12 @@ impl GenerationSchedule {
 
                 if should_save {
                     let chunk_to_save = match chunk {
-                        Chunk::Level(sync_chunk) => Chunk::Level(sync_chunk.clone()),
+                        Chunk::Level(sync_chunk) => {
+                            sync_chunk.take_dirty();
+                            Chunk::Level(Arc::new(
+                                sync_chunk.snapshot(crate::chunk::io::next_save_generation()),
+                            ))
+                        }
                         Chunk::Proto(_) => holder.chunk.take().expect("proto chunk exists"),
                     };
                     chunks.push((*pos, chunk_to_save));
@@ -964,7 +992,7 @@ impl GenerationSchedule {
         }
         drop(data);
 
-        if let Err(e) = self.io_write.blocking_send(chunks) {
+        if let Err(e) = self.io_write.blocking_send(WriteRequest::Chunks(chunks)) {
             error!("Failed to send chunks to io write thread: {:?}", e);
         }
     }
@@ -1009,10 +1037,68 @@ impl GenerationSchedule {
         }
     }
 
+    fn fail_load(&mut self, pos: ChunkPos, error: &str) {
+        self.failed_loads.insert(pos, error.to_owned());
+        self.listener.process_error(pos, error);
+        let mut queue = self
+            .chunk_map
+            .get(&pos)
+            .map_or_else(Vec::new, |holder| holder.tasks.to_vec());
+        let mut seen = HashSetType::default();
+        let mut affected = HashSetType::default();
+        affected.insert(pos);
+        while let Some(key) = queue.pop() {
+            if key.is_null() || !seen.insert(key) {
+                continue;
+            }
+            let Some(node) = self.graph.nodes.get(key) else {
+                continue;
+            };
+            self.failed_loads.insert(node.pos, error.to_owned());
+            self.listener.process_error(node.pos, error);
+            if affected.insert(node.pos)
+                && let Some(holder) = self.chunk_map.get(&node.pos)
+            {
+                queue.extend(holder.tasks);
+            }
+            let mut edge = node.edge;
+            while let Some(entry) = self.graph.edges.get(edge) {
+                queue.push(entry.to);
+                edge = entry.next;
+            }
+        }
+        for pos in affected {
+            if let Some(holder) = self.chunk_map.get_mut(&pos) {
+                for task in &mut holder.tasks {
+                    seen.insert(*task);
+                    *task = NodeKey::null();
+                }
+                seen.insert(holder.occupied);
+                holder.occupied = NodeKey::null();
+                holder.dependency_stage = StagedChunkEnum::None;
+            }
+        }
+        for key in seen {
+            if !key.is_null() {
+                self.waiting_for_chunks.remove(&key);
+                self.drop_node(key);
+            }
+        }
+    }
+
     #[expect(clippy::too_many_lines)]
     fn receive_chunk(&mut self, pos: ChunkPos, data: RecvChunk) {
         match data {
             RecvChunk::IO(chunk) => {
+                if self.failed_loads.contains_key(&pos) {
+                    if matches!(&chunk, Chunk::Level(_)) {
+                        self.failed_loads.remove(&pos);
+                        self.listener.clear_error(pos);
+                    } else {
+                        self.running_task_count -= 1;
+                        return;
+                    }
+                }
                 let mut holder = self.chunk_map.remove(&pos).expect("holder exists");
                 if holder.chunk.is_some() {
                     warn!(
@@ -1068,6 +1154,14 @@ impl GenerationSchedule {
                 let mut dy = 0;
                 for chunk in data.chunks {
                     let new_pos = ChunkPos::new(data.x + dx, data.z + dy);
+                    dy += 1;
+                    if dy == data.size {
+                        dy = 0;
+                        dx += 1;
+                    }
+                    if self.failed_loads.contains_key(&new_pos) {
+                        continue;
+                    }
                     match chunk {
                         Chunk::Level(chunk) => {
                             let mut holder =
@@ -1166,16 +1260,12 @@ impl GenerationSchedule {
                             self.chunk_map.insert(new_pos, holder);
                         }
                     }
-                    dy += 1;
-                    if dy == data.size {
-                        dy = 0;
-                        dx += 1;
-                    }
                 }
 
                 // Neighbor chunks returned to holders — unblock waiting tasks
                 self.check_waiting_tasks();
             }
+            RecvChunk::LoadFailure { error } => self.fail_load(pos, &error),
             RecvChunk::GenerationFailure {
                 pos: fail_pos,
                 stage,
@@ -1186,6 +1276,10 @@ impl GenerationSchedule {
                     fail_pos, stage, error
                 );
 
+                if self.failed_loads.contains_key(&pos) {
+                    self.running_task_count -= 1;
+                    return;
+                }
                 if let Some(mut holder) = self.chunk_map.remove(&pos) {
                     let target_stage = holder.target_stage;
 
@@ -1256,6 +1350,18 @@ impl GenerationSchedule {
             thread::current().name().unwrap_or("unknown")
         );
         loop {
+            let fences = std::mem::take(
+                &mut *level
+                    .save_fences
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            if !fences.is_empty() {
+                self.save_all_chunk(false);
+                for sender in fences {
+                    let _ = self.io_write.blocking_send(WriteRequest::Fence(sender));
+                }
+            }
             if level.should_unload.swap(false, Relaxed) {
                 self.garbage_collect_dependencies();
                 self.process_unload_queue();
@@ -1331,6 +1437,10 @@ impl GenerationSchedule {
                     }
                     node.in_flight = true;
                     let node = node.clone();
+                    if let Some(error) = self.failed_loads.get(&node.pos).cloned() {
+                        self.fail_load(node.pos, &error);
+                        continue;
+                    }
 
                     // A chunk can be advanced as part of a neighboring task's write cache.
                     // In that case its queued node may survive even though the returned
@@ -1719,6 +1829,9 @@ impl GenerationSchedule {
             panic!("nodes count error");
         }
         for (pos, holder) in &self.chunk_map {
+            if self.failed_loads.contains_key(pos) {
+                continue;
+            }
             for i in &holder.tasks {
                 debug_assert!(i.is_null());
             }

@@ -278,6 +278,29 @@ impl<S: SingleChunkDataSerializer> ChunkSerializer for AnvilChunkFile<S> {
     ) -> Result<(), ChunkWritingError> {
         let (x, z) = chunk.position();
         let index = Self::get_chunk_index(x, z);
+        let original = {
+            let region = self.region.lock().await;
+            if region.validated.contains(&index) {
+                None
+            } else {
+                region.records[index].clone()
+            }
+        };
+        if let Some(record) = original {
+            let validation = run_blocking(move || decode::<S>(&record, Vector2::new(x, z)))
+                .await
+                .map_err(|error| {
+                    ChunkWritingError::IoError(std::io::Error::other(error.to_string()))
+                })?;
+            let mut region = self.region.lock().await;
+            if let Err(error) = validation {
+                region.blocked.insert(index);
+                return Err(ChunkWritingError::IoError(std::io::Error::other(
+                    error.to_string(),
+                )));
+            }
+            region.validated.insert(index);
+        }
         let compression = self.region.lock().await.records[index]
             .as_ref()
             .map_or_else(
@@ -340,7 +363,7 @@ impl<S: SingleChunkDataSerializer> ChunkSerializer for AnvilChunkFile<S> {
             items.into_par_iter().for_each(|(pos, record)| {
                 let result = record.map_or_else(
                     || LoadedData::Missing(pos),
-                    |record| match decode(&record, pos) {
+                    |record| match decode::<S>(&record, pos) {
                         Ok(chunk) => LoadedData::Loaded(chunk),
                         Err(error) => LoadedData::Error((pos, error)),
                     },
@@ -349,12 +372,23 @@ impl<S: SingleChunkDataSerializer> ChunkSerializer for AnvilChunkFile<S> {
             });
         });
         while let Some(item) = rx.recv().await {
-            if let LoadedData::Error((pos, _)) = &item {
-                self.region
-                    .lock()
-                    .await
-                    .blocked
-                    .insert(Self::get_chunk_index(pos.x, pos.y));
+            match &item {
+                LoadedData::Error((pos, _)) => {
+                    self.region
+                        .lock()
+                        .await
+                        .blocked
+                        .insert(Self::get_chunk_index(pos.x, pos.y));
+                }
+                LoadedData::Loaded(chunk) => {
+                    let (x, z) = chunk.position();
+                    self.region
+                        .lock()
+                        .await
+                        .validated
+                        .insert(Self::get_chunk_index(x, z));
+                }
+                LoadedData::Missing(_) => {}
             }
             if stream.send(item).await.is_err() {
                 break;
@@ -437,6 +471,37 @@ mod tests {
             let record: &RegionRecord = region.records[0].as_ref().ok_or("missing record")?;
             assert_eq!(decode::<RawChunk>(record, Vector2::new(0, 0))?.0, input);
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod preservation_tests {
+    use super::*;
+    use crate::chunk::ChunkData;
+
+    #[tokio::test]
+    async fn invalid_nbt_record_cannot_be_replaced() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("r.0.0.mca");
+        let mut region = AnvilRegion::default();
+        region.set(
+            0,
+            Some(RegionRecord::new(3, Bytes::from_static(b"invalid NBT"), 1)),
+        )?;
+        region.write(&path, false)?;
+        let original = std::fs::read(&path)?;
+        let mut file = AnvilChunkFile::<ChunkData>::load(&path).await?;
+        assert!(
+            file.update_chunk(
+                Arc::new(ChunkData::empty(0, 0)),
+                &AnvilChunkConfig::default()
+            )
+            .await
+            .is_err()
+        );
+        file.write(&path).await?;
+        assert_eq!(std::fs::read(&path)?, original);
         Ok(())
     }
 }

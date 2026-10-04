@@ -42,7 +42,22 @@ impl<D: Send, E: error::Error> LoadedData<D, E> {
     }
 }
 
+static SAVE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub fn next_save_generation() -> u64 {
+    SAVE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 pub trait Dirtiable {
+    fn take_dirty(&self) -> bool {
+        let dirty = self.is_dirty();
+        self.mark_dirty(false);
+        dirty
+    }
+    fn save_generation(&self) -> u64 {
+        0
+    }
+
     fn is_dirty(&self) -> bool;
     fn mark_dirty(&self, flag: bool);
 }
@@ -92,6 +107,12 @@ where
     /// Tells the `ChunkIO` that no more chunks are loaded in memory
     fn clear_watched_chunks(&self) -> impl Future<Output = ()> + Send + '_;
 
+    /// Commit pending region writes and optionally synchronize affected files.
+    fn flush(
+        &self,
+        synchronize: bool,
+    ) -> impl Future<Output = Result<(), ChunkWritingError>> + Send;
+
     /// Ensure that all ongoing operations are finished
     fn block_and_await_ongoing_tasks(&self) -> impl Future<Output = ()> + Send + '_;
 }
@@ -102,7 +123,7 @@ where
 /// like `ChunkData` or `EntityData`
 pub trait ChunkSerializer: Send + Sync + Default + 'static {
     type Data: Send + Sync + Sized + Dirtiable;
-    type WriteBackend;
+    type WriteBackend: AsRef<Path> + Sync;
 
     type ChunkConfig;
 
@@ -120,9 +141,20 @@ pub trait ChunkSerializer: Send + Sync + Default + 'static {
     /// Synchronize committed file data when a flush is requested.
     fn synchronize(
         &self,
-        _backend: &Self::WriteBackend,
+        backend: &Self::WriteBackend,
     ) -> impl Future<Output = Result<(), std::io::Error>> + Send {
-        async { Ok(()) }
+        async move {
+            let path = backend.as_ref();
+            match tokio::fs::OpenOptions::new().write(true).open(path).await {
+                Ok(file) => file.sync_all().await?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            if let Some(parent) = path.parent() {
+                tokio::fs::File::open(parent).await?.sync_all().await?;
+            }
+            Ok(())
+        }
     }
 
     /// Load a region with access to its external payload directory.
@@ -136,6 +168,9 @@ pub trait ChunkSerializer: Send + Sync + Default + 'static {
                 }
                 Err(error) => return Err(ChunkReadingError::IoError(error)),
             };
+            if bytes.is_empty() {
+                return Err(ChunkReadingError::InvalidHeader);
+            }
             run_blocking(move || Self::read(bytes.into()))
                 .await
                 .map_err(|error| {

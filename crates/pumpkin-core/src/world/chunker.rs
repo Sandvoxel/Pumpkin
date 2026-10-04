@@ -123,10 +123,10 @@ pub fn update_position(player: &Arc<Player>) {
 
         if let Some((held_view, held_sim)) = held_tickets.replace((new_view_level, new_sim_level)) {
             if let Some(view) = held_view {
-                lock.remove_ticket(old_cylindrical.center, view);
+                world.defer_ticket_release(old_cylindrical.center, view);
             }
             if let Some(sim) = held_sim {
-                lock.remove_ticket(old_cylindrical.center, sim);
+                world.defer_ticket_release(old_cylindrical.center, sim);
             }
         }
         lock.send_change();
@@ -164,11 +164,8 @@ pub fn update_position(player: &Arc<Player>) {
                     .mark_chunks_as_not_watched(&unloading_chunks_clone)
                     .await;
 
-                if !chunks_to_clean.is_empty() {
-                    world_clone
-                        .remove_entities_in_chunks(&chunks_to_clean)
-                        .await;
-                    world_clone.level.clean_entity_chunks(&chunks_to_clean);
+                for pos in chunks_to_clean {
+                    world_clone.queue_chunk_unload(pos);
                 }
             });
         }

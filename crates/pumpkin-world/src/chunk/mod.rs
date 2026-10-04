@@ -80,6 +80,7 @@ pub struct ChunkData {
     pub status: ChunkStatus,
     pub blending_data: Option<crate::generation::blender::blending_data::BlendingData>,
     pub dirty: AtomicBool,
+    pub save_generation: AtomicU64,
     pub inhabited_time: AtomicU64,
     pub custom_data: std::sync::Mutex<NbtCompound>,
 }
@@ -95,6 +96,7 @@ pub struct ChunkEntityData {
     pub live: AtomicBool,
 
     pub dirty: AtomicBool,
+    pub save_generation: AtomicU64,
 }
 
 /// Represents pure block data for a chunk.
@@ -625,6 +627,68 @@ impl ChunkSections {
 }
 
 impl ChunkData {
+    /// Capture chunk state before handing it to asynchronous storage.
+    #[must_use]
+    pub fn snapshot(&self, generation: u64) -> Self {
+        use std::sync::{Mutex, atomic::Ordering};
+        Self {
+            section: ChunkSections {
+                count: self.section.count,
+                block_sections: RwLock::new(
+                    self.section
+                        .block_sections
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone(),
+                ),
+                biome_sections: RwLock::new(
+                    self.section
+                        .biome_sections
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone(),
+                ),
+                random_tick_sections: RwLock::new(None),
+                randomly_ticking_mask: std::sync::atomic::AtomicU32::new(0),
+                min_y: self.section.min_y,
+            },
+            heightmap: Mutex::new(
+                self.heightmap
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            ),
+            x: self.x,
+            z: self.z,
+            block_ticks: self.block_ticks.to_vec().into_iter().collect(),
+            fluid_ticks: self.fluid_ticks.to_vec().into_iter().collect(),
+            pending_block_entities: Mutex::new(
+                self.pending_block_entities
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            ),
+            light_engine: Mutex::new(
+                self.light_engine
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            ),
+            light_populated: AtomicBool::new(self.light_populated.load(Ordering::Relaxed)),
+            status: self.status,
+            blending_data: self.blending_data.clone(),
+            dirty: AtomicBool::new(true),
+            save_generation: AtomicU64::new(generation),
+            inhabited_time: AtomicU64::new(self.inhabited_time.load(Ordering::Relaxed)),
+            custom_data: Mutex::new(
+                self.custom_data
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            ),
+        }
+    }
+
     #[must_use]
     pub fn empty(x: i32, z: i32) -> Self {
         Self {
@@ -640,6 +704,7 @@ impl ChunkData {
             status: ChunkStatus::Full,
             blending_data: None,
             dirty: std::sync::atomic::AtomicBool::new(false),
+            save_generation: std::sync::atomic::AtomicU64::new(0),
             inhabited_time: std::sync::atomic::AtomicU64::new(0),
             custom_data: std::sync::Mutex::new(NbtCompound::new()),
         }
@@ -976,11 +1041,49 @@ pub enum ChunkSerializingError {
     ErrorSerializingChunk(pumpkin_nbt::Error),
 }
 
+impl ChunkEntityData {
+    #[must_use]
+    pub fn snapshot(&self, generation: u64) -> Self {
+        use std::sync::{Mutex, atomic::Ordering};
+        Self {
+            x: self.x,
+            z: self.z,
+            data: Mutex::new(
+                self.data
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            ),
+            live: AtomicBool::new(self.live.load(Ordering::Relaxed)),
+            dirty: AtomicBool::new(true),
+            save_generation: AtomicU64::new(generation),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ChunkSections;
     use crate::chunk::palette::BlockPalette;
     use pumpkin_data::{Block, block_properties::has_random_ticks};
+
+    #[test]
+    fn save_snapshot_is_unchanged_by_later_mutations() {
+        use super::ChunkData;
+        use crate::chunk::io::Dirtiable;
+        let chunk = ChunkData::empty(0, 0);
+        chunk.set_block_absolute_y(0, 64, 0, Block::STONE.default_state.id);
+        chunk.mark_dirty(true);
+        assert!(chunk.take_dirty());
+        let snapshot = chunk.snapshot(7);
+        chunk.set_block_absolute_y(0, 64, 0, Block::DIAMOND_BLOCK.default_state.id);
+        chunk.mark_dirty(true);
+        assert_eq!(
+            snapshot.section.get_block_absolute_y(0, 64, 0),
+            Some(Block::STONE.default_state.id)
+        );
+        assert!(chunk.is_dirty());
+    }
 
     #[test]
     fn random_tick_cache_initializes_from_palette_contents() {

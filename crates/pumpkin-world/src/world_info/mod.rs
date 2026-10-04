@@ -606,6 +606,8 @@ pub enum WorldInfoError {
     UnsupportedLevelVersion(i32),
 }
 
+pub use crate::chunk::io::region::atomic_write;
+
 #[cfg(test)]
 mod tests {
     use super::*;

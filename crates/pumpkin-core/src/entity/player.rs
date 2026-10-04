@@ -1235,14 +1235,16 @@ impl Player {
         let chunks_to_clean = level.mark_chunks_as_not_watched(radial_chunks).await;
         // Remove chunks with no watchers from the cache
         if !chunks_to_clean.is_empty() {
-            world.remove_entities_in_chunks(&chunks_to_clean).await;
-            level.clean_entity_chunks(&chunks_to_clean);
+            for pos in &chunks_to_clean {
+                world.queue_chunk_unload(*pos);
+            }
         }
         // Remove left over entries from all possiblily loaded chunks
         let cleaned_chunks = level.clean_memory();
         if !cleaned_chunks.is_empty() {
-            world.remove_entities_in_chunks(&cleaned_chunks).await;
-            level.clean_entity_chunks(&cleaned_chunks);
+            for pos in cleaned_chunks {
+                world.queue_chunk_unload(pos);
+            }
         }
 
         debug!(
@@ -1283,10 +1285,24 @@ impl Player {
             .take();
         if let Some((view_level, sim_level)) = held {
             let center = self.get_entity().chunk_pos.load();
-            if let Some(view) = view_level {
+            if let Some(view) = view_level
+                && !level
+                    .world_portal
+                    .load()
+                    .as_ref()
+                    .as_ref()
+                    .is_some_and(|portal| portal.defer_ticket_release(center, view))
+            {
                 lock.remove_ticket(center, view);
             }
-            if let Some(sim) = sim_level {
+            if let Some(sim) = sim_level
+                && !level
+                    .world_portal
+                    .load()
+                    .as_ref()
+                    .as_ref()
+                    .is_some_and(|portal| portal.defer_ticket_release(center, sim))
+            {
                 lock.remove_ticket(center, sim);
             }
         }
@@ -1914,10 +1930,14 @@ impl Player {
         let max_chunk_z = (pos.0.z + 2) >> 4;
         for cx in min_chunk_x..=max_chunk_x {
             for cz in min_chunk_z..=max_chunk_z {
-                world
+                if world
                     .level
                     .get_or_fetch_chunk(Vector2::new(cx, cz), |_| ())
-                    .await;
+                    .await
+                    .is_err()
+                {
+                    return None;
+                }
             }
         }
 
@@ -3985,8 +4005,9 @@ impl Player {
         let level = &world.level;
         let chunks_to_clean = level.mark_chunks_as_not_watched(radial_chunks).await;
         if !chunks_to_clean.is_empty() {
-            world.remove_entities_in_chunks(&chunks_to_clean).await;
-            level.clean_entity_chunks(&chunks_to_clean);
+            for pos in &chunks_to_clean {
+                world.queue_chunk_unload(*pos);
+            }
         }
         for chunk in &chunks_to_clean {
             self.send_client_packet(&CUnloadChunk::new(chunk.x, chunk.y))

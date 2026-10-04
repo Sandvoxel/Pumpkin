@@ -68,7 +68,7 @@ pub struct PoiChunkData {
 }
 
 /// POI data for a single region (32x32 chunks) using MCA format
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct PoiRegion {
     /// Entries indexed by position
     entries: FxHashMap<(i32, i32, i32), PoiEntry>,
@@ -320,6 +320,7 @@ impl PoiRegion {
 }
 
 /// Region-based POI storage using MCA format
+#[derive(Clone)]
 pub struct PoiStorage {
     /// Path to the poi folder
     folder: PathBuf,
@@ -489,6 +490,13 @@ impl PoiStorage {
 
         if saved > 0 {
             info!("Saved {saved} POI region(s)");
+        }
+        Ok(())
+    }
+
+    pub fn synchronize(&self) -> std::io::Result<()> {
+        for (&(x, z), region) in &self.regions {
+            region.transport.synchronize(&self.region_path(x, z))?;
         }
         Ok(())
     }

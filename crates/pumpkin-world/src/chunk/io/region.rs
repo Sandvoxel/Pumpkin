@@ -75,6 +75,7 @@ pub struct AnvilRegion {
     locations: Vec<u32>,
     dirty: FxHashSet<usize>,
     pub blocked: FxHashSet<usize>,
+    pub validated: FxHashSet<usize>,
 }
 
 impl Default for AnvilRegion {
@@ -84,6 +85,7 @@ impl Default for AnvilRegion {
             locations: vec![0; CHUNK_COUNT],
             dirty: FxHashSet::default(),
             blocked: FxHashSet::default(),
+            validated: FxHashSet::default(),
         }
     }
 }

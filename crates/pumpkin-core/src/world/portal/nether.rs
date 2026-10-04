@@ -528,23 +528,31 @@ impl NetherPortal {
         if !candidate_chunks.is_empty()
             && let Ok(handle) = tokio::runtime::Handle::try_current()
         {
-            tokio::task::block_in_place(|| {
+            let loaded = tokio::task::block_in_place(|| {
                 handle.block_on(async {
                     for chunk in &candidate_chunks {
                         for dx in -1..=1 {
                             for dz in -1..=1 {
-                                world
+                                if world
                                     .level
                                     .get_or_fetch_chunk(
                                         Vector2::new(chunk.x + dx, chunk.y + dz),
                                         |_| (),
                                     )
-                                    .await;
+                                    .await
+                                    .is_err()
+                                {
+                                    return false;
+                                }
                             }
                         }
                     }
-                });
+                    true
+                })
             });
+            if !loaded {
+                return None;
+            }
         }
 
         let worldborder = world

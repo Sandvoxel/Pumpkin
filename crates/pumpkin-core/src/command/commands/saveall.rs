@@ -13,7 +13,7 @@ const DESCRIPTION: &str = "Saves the server to disk.";
 
 const PERMISSION: &str = "minecraft:command.save-all";
 
-struct SaveAllExecutor;
+struct SaveAllExecutor(crate::world::saving::SaveMode);
 
 impl CommandExecutor for SaveAllExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
@@ -29,8 +29,9 @@ impl CommandExecutor for SaveAllExecutor {
         let server_arc = context.server().clone();
         let server_clone = server_arc.clone();
         let source = context.source.clone();
+        let mode = self.0;
         server_arc.spawn_task(async move {
-            if let Err(err) = server_clone.save_all().await {
+            if let Err(err) = server_clone.save_all_with_mode(mode).await {
                 error!("Failed to save server data: {err}");
                 source.send_error(TextComponent::translate_cross(
                     translation::java::COMMANDS_SAVE_FAILED,
@@ -63,7 +64,9 @@ pub fn register(dispatcher: &mut CommandDispatcher, registry: &PermissionRegistr
     dispatcher.register(
         command("save-all", DESCRIPTION)
             .requires(PERMISSION)
-            .executes(SaveAllExecutor)
-            .then(literal("flush").executes(SaveAllExecutor)),
+            .executes(SaveAllExecutor(crate::world::saving::SaveMode::Manual))
+            .then(
+                literal("flush").executes(SaveAllExecutor(crate::world::saving::SaveMode::Flush)),
+            ),
     );
 }

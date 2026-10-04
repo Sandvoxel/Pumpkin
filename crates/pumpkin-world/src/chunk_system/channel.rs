@@ -130,6 +130,11 @@ impl LevelChannel {
             && lock.1.is_none()
             && !level.should_unload.load(SeqCst)
             && !level.should_save.load(SeqCst)
+            && level
+                .save_fences
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
             && !level.shut_down_chunk_system.load(SeqCst)
         {
             let (new_lock, timeout_res) = self

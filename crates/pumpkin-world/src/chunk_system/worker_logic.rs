@@ -13,8 +13,16 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 use tracing::{debug, error, warn};
 
+pub enum WriteRequest {
+    Chunks(Vec<(ChunkPos, Chunk)>),
+    Fence(tokio::sync::oneshot::Sender<Result<(), String>>),
+}
+
 pub enum RecvChunk {
     IO(Chunk),
+    LoadFailure {
+        error: String,
+    },
     Generation(Cache),
     GenerationFailure {
         pos: ChunkPos,
@@ -145,9 +153,7 @@ pub async fn io_read_work(
                     let result = run_blocking(move || process_loaded_chunk(chunk, &level)).await;
                     let received = match result {
                         Ok(processed) => RecvChunk::IO(processed),
-                        Err(err) => RecvChunk::GenerationFailure {
-                            pos,
-                            stage: StagedChunkEnum::Empty,
+                        Err(err) => RecvChunk::LoadFailure {
                             error: err.to_string(),
                         },
                     };
@@ -155,7 +161,16 @@ pub async fn io_read_work(
                         break;
                     }
                 }
-                LoadedData::Missing(pos) | LoadedData::Error((pos, _)) => {
+                LoadedData::Error((pos, error)) => {
+                    error!("Failed loading chunk {pos:?}: {error}");
+                    let _ = send.send((
+                        pos,
+                        RecvChunk::LoadFailure {
+                            error: error.to_string(),
+                        },
+                    ));
+                }
+                LoadedData::Missing(pos) => {
                     if send
                         .send((
                             pos,
@@ -177,14 +192,39 @@ pub async fn io_read_work(
     debug!("io read thread stop");
 }
 
+#[expect(clippy::too_many_lines)]
 pub async fn io_write_work(
-    mut recv: tokio::sync::mpsc::Receiver<Vec<(ChunkPos, Chunk)>>,
+    mut recv: tokio::sync::mpsc::Receiver<WriteRequest>,
     level: Arc<Level>,
     lock: IOLock,
 ) {
+    let mut pending = rustc_hash::FxHashMap::default();
     loop {
-        // Don't check cancel_token here (keep saving chunks)
-        let Some(data) = recv.recv().await else { break };
+        let Some(request) = recv.recv().await else {
+            break;
+        };
+        let data = match request {
+            WriteRequest::Chunks(data) => data,
+            WriteRequest::Fence(sender) => {
+                let result = level
+                    .chunk_saver
+                    .save_chunks(
+                        &level.level_folder,
+                        pending
+                            .iter()
+                            .map(|(pos, chunk): (&ChunkPos, &crate::level::SyncChunk)| {
+                                (*pos, chunk.clone())
+                            })
+                            .collect(),
+                    )
+                    .await;
+                if result.is_ok() {
+                    pending.clear();
+                }
+                let _ = sender.send(result.map_err(|error| error.to_string()));
+                continue;
+            }
+        };
         // debug!("io write thread receive chunks size {}", data.len());
         let positions = data.iter().map(|(pos, _)| *pos).collect::<Vec<_>>();
         let level_for_upgrade = level.clone();
@@ -209,12 +249,30 @@ pub async fn io_write_work(
         .await;
         let upgrade_failed = match upgrade_result {
             Ok(vec) => {
-                if let Err(e) = level
+                for (pos, chunk) in vec {
+                    if pending
+                        .get(&pos)
+                        .is_none_or(|old: &crate::level::SyncChunk| {
+                            old.save_generation.load(Relaxed) <= chunk.save_generation.load(Relaxed)
+                        })
+                    {
+                        pending.insert(pos, chunk);
+                    }
+                }
+                let result = level
                     .chunk_saver
-                    .save_chunks(&level.level_folder, vec)
-                    .await
-                {
-                    error!("Failed to save chunks: {:?}", e);
+                    .save_chunks(
+                        &level.level_folder,
+                        pending
+                            .iter()
+                            .map(|(pos, chunk)| (*pos, chunk.clone()))
+                            .collect(),
+                    )
+                    .await;
+                if let Err(error) = result {
+                    error!("Failed to save chunks: {error}");
+                } else {
+                    pending.clear();
                 }
                 false
             }

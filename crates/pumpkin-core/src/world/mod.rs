@@ -30,6 +30,7 @@ pub mod map;
 pub mod portal;
 pub mod raid;
 pub mod random_sequences;
+pub mod saving;
 pub mod stopwatches;
 pub mod time;
 pub mod villager_poi;
@@ -294,6 +295,7 @@ pub struct World {
     pending_block_entity_migrations: crossbeam::queue::SegQueue<Vector2<i32>>,
     /// Persistent custom data for the world (matching Bukkit's `PersistentDataHolder`)
     pub custom_data: std::sync::Mutex<NbtCompound>,
+    save_state: saving::SaveState,
     /// Persistent custom data for block entities at specific positions
     pub custom_block_entity_data: DashMap<BlockPos, NbtCompound>,
     /// Entity tracker responsible for tracking entity visibility and sending delta/status packets to watchers.
@@ -337,6 +339,7 @@ impl World {
                     .unwrap_or(Block::AIR.default_state.id)
             })
             .await
+            .unwrap_or(Block::VOID_AIR.default_state.id)
     }
 
     pub async fn get_block_state_async(&self, position: &BlockPos) -> &'static BlockState {
@@ -360,6 +363,7 @@ impl World {
                     .get(height_map, x, z, self.min_y)
             })
             .await
+            .unwrap_or(self.min_y)
     }
 
     #[must_use]
@@ -429,6 +433,7 @@ impl World {
             block_entities: DashMap::new(),
             pending_block_entity_migrations: crossbeam::queue::SegQueue::new(),
             custom_data: std::sync::Mutex::new(custom_data),
+            save_state: saving::SaveState::default(),
             custom_block_entity_data: DashMap::new(),
             entity_tracker: entity_tracker::EntityTracker::new(),
         }
@@ -580,78 +585,10 @@ impl World {
     }
 
     pub async fn shutdown(&self) {
-        let entities = self.entities.load_full();
-        self.save_entities_by_chunk(&entities, self.level.live_entity_chunk_positions())
-            .await;
-
-        let chunks: Vec<Vector2<i32>> = self
-            .block_entities
-            .iter()
-            .map(|chunk_block_entities| *chunk_block_entities.key())
-            .collect();
-        for chunk_pos in chunks {
-            self.save_block_entities(chunk_pos);
+        if let Err(error) = self.save_for_shutdown().await {
+            error!("Failed saving world during shutdown: {error}");
         }
-
-        // Save portal POI to disk
-        let save_result = self
-            .portal_poi
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .save_all();
-        if let Err(e) = save_result {
-            error!("Failed to save portal POI: {e}");
-        }
-
         self.level.shutdown().await;
-    }
-
-    /// Writes `entities` into the saved data of the chunks they are in. A live chunk is
-    /// rebuilt from scratch, so `snapshot_chunks` lists the live chunks that must be rewritten
-    /// even when nothing is left in them; a chunk that never went live keeps its records.
-    async fn save_entities_by_chunk(
-        &self,
-        entities: &[Arc<dyn EntityBase>],
-        snapshot_chunks: impl IntoIterator<Item = Vector2<i32>>,
-    ) {
-        let mut groups: FxHashMap<Vector2<i32>, Vec<NbtCompound>> = FxHashMap::default();
-        for entity in entities {
-            let base_entity = entity.get_entity();
-            if base_entity.is_removed() {
-                continue;
-            }
-            let mut nbt = NbtCompound::new();
-            entity.write_nbt(&mut nbt);
-            groups
-                .entry(base_entity.chunk_pos.load())
-                .or_default()
-                .push(nbt);
-        }
-        for pos in snapshot_chunks {
-            groups.entry(pos).or_default();
-        }
-
-        for (pos, records) in groups {
-            let chunk = if records.is_empty() {
-                let Some(chunk) = self.level.get_entity_chunk_sync(&pos) else {
-                    continue;
-                };
-                chunk
-            } else {
-                self.level.get_entity_chunk(pos).await
-            };
-            let live = chunk.live.load(Relaxed);
-            if !live && records.is_empty() {
-                continue;
-            }
-            let mut data = chunk
-                .data
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            merge_entity_records(&mut data, live, records);
-            drop(data);
-            chunk.mark_dirty(true);
-        }
     }
 
     /// Serializes the live block entities of a chunk back into that chunk's block
@@ -1678,6 +1615,8 @@ impl World {
             dragon_fight::DragonFight::tick(fight_mutex, self);
         }
 
+        self.process_save_requests();
+
         let total_elapsed = start.elapsed();
         if total_elapsed.as_millis() > 50 {
             debug!(
@@ -1887,14 +1826,8 @@ impl World {
             if level_time.world_age % 100 == 0 {
                 self.level.should_unload.store(true, Relaxed);
                 let cleaned_chunks = self.level.clean_memory();
-                if !cleaned_chunks.is_empty() {
-                    let world_clone = self.clone();
-                    if let Some(server) = self.server.upgrade() {
-                        server.spawn_task(async move {
-                            world_clone.remove_entities_in_chunks(&cleaned_chunks).await;
-                            world_clone.level.clean_entity_chunks(&cleaned_chunks);
-                        });
-                    }
+                for pos in cleaned_chunks {
+                    self.queue_chunk_unload(pos);
                 }
                 // If autosave is configured and this tick will trigger an autosave, don't double notify
                 if self.level.autosave_ticks == 0 {
@@ -1909,8 +1842,7 @@ impl World {
             if self.level.autosave_ticks > 0 && self.level.save_enabled.load(Relaxed) {
                 let autosave = self.level.autosave_ticks as i64;
                 if autosave > 0 && level_time.world_age % autosave == 0 {
-                    self.level.should_save.store(true, Relaxed);
-                    self.level.level_channel.notify();
+                    self.save_state.autosave.store(true, Relaxed);
                 }
             }
             (level_time.is_night(), level_time.time_of_day)
@@ -2684,7 +2616,10 @@ impl World {
         } else {
             let spawn_position = Vector2::new(level_info.spawn_x, level_info.spawn_z);
             let chunk_pos = Vector2::new(level_info.spawn_x >> 4, level_info.spawn_z >> 4);
-            self.level.get_or_fetch_chunk(chunk_pos, |_| ()).await;
+            if let Err(error) = self.level.get_or_fetch_chunk(chunk_pos, |_| ()).await {
+                error!("Failed loading spawn chunk: {error}");
+                return;
+            }
             let top = self.get_top_block(spawn_position);
             let pos_y = if top > self.dimension.min_y {
                 top + 1
@@ -3261,7 +3196,10 @@ impl World {
             let info = &self.level_info.load();
             let spawn_position = Vector2::new(info.spawn_x, info.spawn_z);
             let chunk_pos = Vector2::new(info.spawn_x >> 4, info.spawn_z >> 4);
-            self.level.get_or_fetch_chunk(chunk_pos, |_| ()).await;
+            if let Err(error) = self.level.get_or_fetch_chunk(chunk_pos, |_| ()).await {
+                error!("Failed loading spawn chunk: {error}");
+                return;
+            }
             let top = self.get_top_block(spawn_position);
             let pos_y = if top > self.dimension.min_y {
                 top + 1
@@ -3288,6 +3226,13 @@ impl World {
             .level
             .get_or_fetch_chunk(center_chunk, std::clone::Clone::clone)
             .await;
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                error!("Failed loading centre chunk: {error}");
+                return;
+            }
+        };
         if let Some(server) = self.server.upgrade() {
             let mut event =
                 crate::plugin::world::chunk_send::ChunkSend::new(player.world(), chunk.clone());
@@ -3957,10 +3902,14 @@ impl World {
             // proper spawn position calculation (see #1381). The y-level calculation
             // needs to account for spawn radius and find a safe spawn position.
             let chunk_pos = Vector2::new(spawn_x >> 4, spawn_z >> 4);
-            default_world
+            if let Err(error) = default_world
                 .level
                 .get_or_fetch_chunk(chunk_pos, |_| ())
-                .await;
+                .await
+            {
+                error!("Failed loading respawn chunk: {error}");
+                return;
+            }
             let top = default_world.get_top_block(Vector2::new(spawn_x, spawn_z));
             let pos_y = if top > default_world.dimension.min_y {
                 top + 1
@@ -4243,7 +4192,7 @@ impl World {
                     }
                 };
 
-                let Some((chunk_weak, first_load)) = recv_result else {
+                let Some((chunk_weak, _first_load)) = recv_result else {
                     break;
                 };
 
@@ -4264,7 +4213,13 @@ impl World {
                     continue 'main;
                 }
 
-                if first_load {
+                if chunk.live.swap(true, Ordering::AcqRel) {
+                    // Already live for other watchers: pair this player now so
+                    // spawn packets and vehicle restore do not wait on a tracker tick.
+                    world
+                        .entity_tracker
+                        .update_player_chunks(&player, &world, &[position]);
+                } else {
                     // First watcher: consume the serialized entities and make them
                     // live. The live entity list becomes the single source of
                     // truth, so the chunk's NBT is taken (cleared) to avoid keeping
@@ -4310,12 +4265,7 @@ impl World {
                         world.add_entity_silent(entity.clone());
                         player.try_restore_vehicle(&entity);
                     }
-                } else {
-                    // Already live for other watchers: pair this player now so
-                    // spawn packets and vehicle restore do not wait on a tracker tick.
-                    world
-                        .entity_tracker
-                        .update_player_chunks(&player, &world, &[position]);
+
                 }
             }
 
@@ -4709,6 +4659,13 @@ impl World {
             .level
             .get_or_fetch_chunk(center_chunk, std::clone::Clone::clone)
             .await;
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                error!("Failed loading centre chunk: {error}");
+                return;
+            }
+        };
         java_client.send_chunks(&[chunk]).await;
         player
             .chunk_sender
@@ -4939,43 +4896,16 @@ impl World {
         });
     }
 
+    #[expect(
+        clippy::unused_async,
+        reason = "Retain the existing asynchronous native plugin wrapper"
+    )]
     pub async fn remove_entities_in_chunks(
         &self,
         chunks: impl IntoIterator<Item = impl std::borrow::Borrow<Vector2<i32>>>,
     ) {
-        let chunks_set: FxHashSet<_> = chunks.into_iter().map(|c| *c.borrow()).collect();
-        if chunks_set.is_empty() {
-            return;
-        }
-        let mut entities_to_remove = Vec::new();
-
-        self.entities.rcu(|current_entities| {
-            entities_to_remove.clear();
-            let mut new_entities = (**current_entities).clone();
-            new_entities.retain(|entity| {
-                let base_entity = entity.get_entity();
-                let pos = base_entity.chunk_pos.load();
-                if chunks_set.contains(&pos) {
-                    entities_to_remove.push(entity.clone());
-                    false
-                } else {
-                    true
-                }
-            });
-            new_entities
-        });
-
-        self.save_entities_by_chunk(&entities_to_remove, chunks_set.iter().copied())
-            .await;
-
-        for entity in entities_to_remove {
-            self.entity_tracker.remove_entity(entity.as_ref(), self);
-            self.spawn_state.load().remove_entity(self, entity.as_ref());
-        }
-
-        for chunk_pos in &chunks_set {
-            self.save_block_entities(*chunk_pos);
-            self.block_entities.remove(chunk_pos);
+        for pos in chunks {
+            self.queue_chunk_unload(*pos.borrow());
         }
     }
 
@@ -6948,49 +6878,8 @@ impl World {
     }
 
     pub async fn save(&self) {
-        let entities = self.entities.load_full();
-        self.save_entities_by_chunk(&entities, self.level.live_entity_chunk_positions())
-            .await;
-
-        let chunks: Vec<Vector2<i32>> = self
-            .block_entities
-            .iter()
-            .map(|chunk_block_entities| *chunk_block_entities.key())
-            .collect();
-        for chunk_pos in chunks {
-            self.save_block_entities(chunk_pos);
-        }
-
-        if let Ok(mut portal_poi) = self.portal_poi.try_lock() {
-            let _ = portal_poi.save_all();
-        }
-
-        {
-            let custom_data = self
-                .custom_data
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !custom_data.is_empty() {
-                let custom_data_path = self
-                    .level
-                    .level_folder
-                    .root_folder
-                    .join("pumpkin_custom_data.nbt");
-                let nbt = pumpkin_nbt::Nbt::from(custom_data.clone());
-                let _ = std::fs::write(custom_data_path, nbt.write());
-            }
-        }
-
-        self.level
-            .should_save
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        self.level.level_channel.notify();
-
-        let mut save_event = crate::plugin::api::events::world::world_save::WorldSaveEvent::new(
-            format!("{:?}", self.dimension),
-        );
-        if let Some(server) = self.server.upgrade() {
-            server.plugin_manager.fire(&server, &mut save_event).await;
+        if let Err(error) = self.save_with_mode(saving::SaveMode::Manual).await {
+            error!("Failed saving world: {error}");
         }
     }
 
@@ -7297,6 +7186,15 @@ pub struct WorldPortal(pub Arc<World>);
 
 // Pure Beauty :cap:
 impl WorldPortalExt for WorldPortal {
+    fn defer_ticket_release(&self, pos: Vector2<i32>, level: i8) -> bool {
+        self.0.defer_ticket_release(pos, level);
+        true
+    }
+
+    fn prepare_chunk_unload(&self, pos: Vector2<i32>) -> bool {
+        self.0.prepare_chunk_unload(pos)
+    }
+
     fn can_place_at(
         &self,
         block: &pumpkin_data::Block,

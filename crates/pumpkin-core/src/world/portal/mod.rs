@@ -93,16 +93,19 @@ impl PortalType {
 
                         // Ensure chunks covering the platform are loaded/generated
                         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                            tokio::task::block_in_place(|| {
+                            let loaded = tokio::task::block_in_place(|| {
                                 handle.block_on(async {
                                     let center_chunk =
                                         Vector2::new(platform_pos.0.x >> 4, platform_pos.0.z >> 4);
                                     dest_world
                                         .level
                                         .get_or_fetch_chunk(center_chunk, |_| ())
-                                        .await;
-                                });
+                                        .await
+                                })
                             });
+                            if loaded.is_err() {
+                                return None;
+                            }
                         }
 
                         // Generate/regenerate the obsidian platform (5x5 obsidian at Y=48, and 5x5x3 air above it)
@@ -208,7 +211,7 @@ impl PortalType {
                 .or_else(|| {
                     // Ensure the chunks around approximate_exit_pos are generated/loaded in dest_world
                     if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                        tokio::task::block_in_place(|| {
+                        let loaded = tokio::task::block_in_place(|| {
                             handle.block_on(async {
                                 let center_chunk = Vector2::new(
                                     approximate_exit_pos.0.x >> 4,
@@ -218,14 +221,22 @@ impl PortalType {
                                     for dz in -1..=1 {
                                         let chunk_pos =
                                             Vector2::new(center_chunk.x + dx, center_chunk.y + dz);
-                                        dest_world
+                                        if dest_world
                                             .level
                                             .get_or_fetch_chunk(chunk_pos, |_| ())
-                                            .await;
+                                            .await
+                                            .is_err()
+                                        {
+                                            return false;
+                                        }
                                     }
                                 }
-                            });
+                                true
+                            })
                         });
+                        if !loaded {
+                            return None;
+                        }
                     }
 
                     if let Some((build_pos, axis, is_fallback)) = NetherPortal::find_safe_location(
