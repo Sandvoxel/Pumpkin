@@ -1,4 +1,4 @@
-use std::{error, sync::Arc};
+use std::{error, path::Path, sync::Arc};
 
 use bytes::Bytes;
 use pumpkin_util::math::vector2::Vector2;
@@ -7,6 +7,7 @@ use super::{ChunkReadingError, ChunkWritingError};
 use crate::level::LevelFolder;
 
 pub mod file_manager;
+pub(crate) mod region;
 
 pub(crate) async fn run_blocking<T, F>(task: F) -> Result<T, tokio::task::JoinError>
 where
@@ -115,6 +116,33 @@ pub trait ChunkSerializer: Send + Sync + Default + 'static {
         &self,
         backend: &Self::WriteBackend,
     ) -> impl Future<Output = Result<(), std::io::Error>> + Send;
+
+    /// Synchronize committed file data when a flush is requested.
+    fn synchronize(
+        &self,
+        _backend: &Self::WriteBackend,
+    ) -> impl Future<Output = Result<(), std::io::Error>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Load a region with access to its external payload directory.
+    #[must_use]
+    fn load(path: &Path) -> impl Future<Output = Result<Self, ChunkReadingError>> + Send {
+        async move {
+            let bytes = match tokio::fs::read(path).await {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(Self::default());
+                }
+                Err(error) => return Err(ChunkReadingError::IoError(error)),
+            };
+            run_blocking(move || Self::read(bytes.into()))
+                .await
+                .map_err(|error| {
+                    ChunkReadingError::IoError(std::io::Error::other(error.to_string()))
+                })?
+        }
+    }
 
     /// Create a new instance from bytes
     fn read(r: Bytes) -> Result<Self, ChunkReadingError>;

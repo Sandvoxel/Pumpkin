@@ -1,10 +1,13 @@
 use rustc_hash::FxHashMap;
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
+use crate::chunk::{
+    format::anvil::Compression as AnvilCompression,
+    io::region::{AnvilRegion, RegionRecord},
+};
 use flate2::Compression;
-use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use pumpkin_util::math::position::BlockPos;
 use pumpkin_util::math::vector3::Vector3;
@@ -12,15 +15,6 @@ use serde::{Deserialize, Serialize};
 
 /// POI type identifier for nether portals
 pub const POI_TYPE_NETHER_PORTAL: &str = "minecraft:nether_portal";
-
-/// MCA format constants
-const SECTOR_SIZE: usize = 4096;
-const REGION_SIZE: usize = 32;
-const CHUNK_COUNT: usize = REGION_SIZE * REGION_SIZE;
-const HEADER_SIZE: usize = SECTOR_SIZE * 2; // Location table + timestamp table
-
-/// Compression type for MCA format
-const COMPRESSION_ZLIB: u8 = 2;
 
 // Data version for 1.21
 const DATA_VERSION: i32 = 3955;
@@ -81,6 +75,8 @@ pub struct PoiRegion {
     /// Track which chunks are dirty
     dirty_chunks: rustc_hash::FxHashSet<(i32, i32)>,
     dirty: bool,
+    transport: AnvilRegion,
+    load_error: Option<String>,
 }
 
 impl PoiRegion {
@@ -205,10 +201,17 @@ impl PoiRegion {
     }
 
     /// Decompress chunk data from bytes
-    fn decompress_chunk_data(compressed: &[u8]) -> std::io::Result<PoiChunkData> {
-        let mut decoder = ZlibDecoder::new(compressed);
-        let mut uncompressed = Vec::new();
-        decoder.read_to_end(&mut uncompressed)?;
+    fn decompress_chunk_data(compressed: &[u8], compression: u8) -> std::io::Result<PoiChunkData> {
+        let compression = AnvilCompression::from_byte(compression)
+            .map_err(|()| std::io::Error::other("Unknown POI compression"))?;
+        let uncompressed = if let Some(compression) = compression {
+            compression
+                .decompress_data(compressed)
+                .map_err(|error| std::io::Error::other(error.to_string()))?
+                .into_vec()
+        } else {
+            compressed.to_vec()
+        };
 
         let mut cursor = Cursor::new(uncompressed);
         let mut reader = pumpkin_nbt::deserializer::NbtReadHelperJava::new(
@@ -254,172 +257,64 @@ impl PoiRegion {
     }
 
     pub fn save(&mut self, path: &Path) -> std::io::Result<()> {
+        if let Some(error) = &self.load_error {
+            return Err(std::io::Error::other(error.clone()));
+        }
         if !self.dirty {
             return Ok(());
         }
-
-        if self.entries.is_empty() {
-            // Don't save empty regions, delete the file if it exists
-            if path.exists() {
-                std::fs::remove_file(path)?;
-            }
-            self.dirty = false;
-            self.dirty_chunks.clear();
-            return Ok(());
-        }
-
-        // Build all chunk data
-        let mut chunk_data_map: FxHashMap<usize, Vec<u8>> = FxHashMap::default();
-
-        // Collect all unique chunks that have entries
-        let mut chunks_with_data: rustc_hash::FxHashSet<(i32, i32)> =
-            rustc_hash::FxHashSet::default();
-        for entry in self.entries.values() {
-            chunks_with_data.insert((entry.x >> 4, entry.z >> 4));
-        }
-
-        for (chunk_x, chunk_z) in &chunks_with_data {
-            if let Some(chunk_data) = self.get_chunk_data(*chunk_x, *chunk_z) {
-                let compressed = Self::compress_chunk_data(&chunk_data)?;
-                let index = Self::chunk_index(*chunk_x, *chunk_z);
-                chunk_data_map.insert(index, compressed);
-            }
-        }
-
-        // Build MCA file
-        let mut location_table = [0u32; CHUNK_COUNT];
-        let mut timestamp_table = [0u32; CHUNK_COUNT];
-        let mut sector_data: Vec<Vec<u8>> = Vec::new();
-
+        let mut transport = self.transport.clone();
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs() as u32);
-
-        // Start after header (2 sectors)
-        let mut current_sector: u32 = 2;
-
-        for index in 0..CHUNK_COUNT {
-            if let Some(compressed) = chunk_data_map.get(&index) {
-                // Calculate sector count needed
-                let data_len = compressed.len() + 5; // 4 bytes length + 1 byte compression + data
-                let sector_count = data_len.div_ceil(SECTOR_SIZE) as u32;
-
-                // Build padded sector data
-                let mut padded = Vec::with_capacity(sector_count as usize * SECTOR_SIZE);
-                let length = (compressed.len() + 1) as u32; // +1 for compression byte
-                padded.extend_from_slice(&length.to_be_bytes());
-                padded.push(COMPRESSION_ZLIB);
-                padded.extend_from_slice(compressed);
-                // Pad to sector boundary
-                padded.resize(sector_count as usize * SECTOR_SIZE, 0);
-
-                location_table[index] = (current_sector << 8) | sector_count;
-                timestamp_table[index] = timestamp;
-                sector_data.push(padded);
-
-                current_sector += sector_count;
-            }
+            .map_or(0, |duration| duration.as_secs() as u32);
+        for &(x, z) in &self.dirty_chunks {
+            let index = Self::chunk_index(x, z);
+            let record = self
+                .get_chunk_data(x, z)
+                .map(|data| {
+                    Self::compress_chunk_data(&data)
+                        .map(|payload| RegionRecord::new(2, payload.into(), timestamp))
+                })
+                .transpose()?;
+            transport.set(index, record)?;
         }
-
-        // Write file
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-
-        let mut file = std::fs::File::create(path)?;
-
-        // Write location table
-        for loc in &location_table {
-            file.write_all(&loc.to_be_bytes())?;
-        }
-
-        // Write timestamp table
-        for ts in &timestamp_table {
-            file.write_all(&ts.to_be_bytes())?;
-        }
-
-        // Write chunk data
-        for data in &sector_data {
-            file.write_all(data)?;
-        }
-
-        self.dirty = false;
-        self.dirty_chunks.clear();
+        transport.write(path, false)?;
+        self.transport = transport;
+        self.mark_clean();
         Ok(())
     }
 
     pub fn load(path: &Path) -> std::io::Result<Self> {
-        if !path.exists() {
-            return Ok(Self::new());
-        }
-
-        let file_data = std::fs::read(path)?;
-        if file_data.len() < HEADER_SIZE {
-            return Ok(Self::new());
-        }
-
-        let mut region = Self::new();
-
-        // Parse location table
-        for index in 0..CHUNK_COUNT {
-            let offset = index * 4;
-            let location = u32::from_be_bytes([
-                file_data[offset],
-                file_data[offset + 1],
-                file_data[offset + 2],
-                file_data[offset + 3],
-            ]);
-
-            let sector_offset = (location >> 8) as usize;
-            let sector_count = (location & 0xFF) as usize;
-
-            if sector_offset == 0 || sector_count == 0 {
+        let transport = AnvilRegion::load(path)?;
+        let mut region = Self {
+            transport,
+            ..Self::default()
+        };
+        for index in 0..region.transport.records.len() {
+            let Some(record) = &region.transport.records[index] else {
                 continue;
-            }
-
-            let byte_offset = sector_offset * SECTOR_SIZE;
-            let byte_end = byte_offset + sector_count * SECTOR_SIZE;
-
-            if byte_end > file_data.len() {
-                continue;
-            }
-
-            // Read chunk data
-            let chunk_bytes = &file_data[byte_offset..byte_end];
-            if chunk_bytes.len() < 5 {
-                continue;
-            }
-
-            let length = u32::from_be_bytes([
-                chunk_bytes[0],
-                chunk_bytes[1],
-                chunk_bytes[2],
-                chunk_bytes[3],
-            ]) as usize;
-            let compression = chunk_bytes[4];
-
-            if compression != COMPRESSION_ZLIB || length < 1 || length > chunk_bytes.len() - 4 {
-                continue;
-            }
-
-            let compressed = &chunk_bytes[5..5 + length - 1];
-
-            match Self::decompress_chunk_data(compressed) {
-                Ok(chunk_data) => {
-                    for (_section_key, section) in chunk_data.sections {
+            };
+            let data = record.load_error.as_ref().map_or_else(
+                || Self::decompress_chunk_data(&record.payload, record.compression),
+                |error| Err(std::io::Error::other(error.clone())),
+            );
+            match data {
+                Ok(data) => {
+                    for section in data.sections.into_values() {
                         for entry in section.records {
-                            let key = (entry.x, entry.y, entry.z);
-                            region.entries.insert(key, entry);
+                            region.entries.insert((entry.x, entry.y, entry.z), entry);
                         }
                     }
                 }
-                Err(e) => {
-                    warn!("Failed to parse POI chunk at index {index}: {e}");
+                Err(error) => {
+                    warn!("Failed to parse POI chunk at index {index}: {error}");
+                    region.transport.blocked.insert(index);
                 }
             }
         }
-
-        region.dirty = false;
         Ok(region)
     }
 }
@@ -458,7 +353,10 @@ impl PoiStorage {
                 if path.exists() {
                     warn!("Failed to load POI region {}: {}", path.display(), e);
                 }
-                PoiRegion::new()
+                PoiRegion {
+                    load_error: Some(e.to_string()),
+                    ..PoiRegion::default()
+                }
             })
         })
     }

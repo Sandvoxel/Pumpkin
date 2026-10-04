@@ -17,7 +17,7 @@ use crate::{
     level::LevelFolder,
 };
 
-use super::{ChunkSerializer, FileIO, LoadedData, run_blocking};
+use super::{ChunkSerializer, FileIO, LoadedData};
 
 /// A simple implementation of the `ChunkSerializer` trait that loads and saves data
 /// to disk using parallelism and a lazy-loading cache keyed by file path.
@@ -96,31 +96,7 @@ impl<S: ChunkSerializer<WriteBackend = PathBuf> + 'static> ChunkSerializerLazyLo
     async fn read_from_disk(&self) -> Result<S, ChunkReadingError> {
         trace!("Opening file from disk: {}", self.path.display());
 
-        match tokio::fs::read(&self.path).await {
-            Ok(bytes) => {
-                if bytes.is_empty() {
-                    trace!(
-                        "File is empty (0 bytes), using default for: {}",
-                        self.path.display()
-                    );
-                    return Ok(S::default());
-                }
-                let value = run_blocking(move || S::read(bytes.into()))
-                    .await
-                    .map_err(|_| {
-                        ChunkReadingError::IoError(std::io::Error::other(
-                            "chunk deserialization task failed",
-                        ))
-                    })??;
-                trace!("Successfully read file from disk: {}", self.path.display());
-                Ok(value)
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                trace!("File not found, using default for: {}", self.path.display());
-                Ok(S::default())
-            }
-            Err(err) => Err(ChunkReadingError::IoError(err)),
-        }
+        S::load(&self.path).await
     }
 }
 
