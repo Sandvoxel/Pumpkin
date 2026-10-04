@@ -150,7 +150,9 @@ fn default_level_name() -> String {
     DEFAULT_LEVEL_NAME.to_string()
 }
 fn default_spawn_dimension() -> String {
-    pumpkin_data::dimension::Dimension::OVERWORLD.minecraft_name.to_string()
+    pumpkin_data::dimension::Dimension::OVERWORLD
+        .minecraft_name
+        .to_string()
 }
 const fn default_spawn_y() -> i32 {
     DEFAULT_SPAWN_Y

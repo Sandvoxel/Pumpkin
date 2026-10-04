@@ -7247,6 +7247,10 @@ pub struct WorldPortal(pub Arc<World>);
 
 // Pure Beauty :cap:
 impl WorldPortalExt for WorldPortal {
+    fn saves_chunks_at_tick_boundary(&self) -> bool {
+        true
+    }
+
     fn defer_ticket_release(&self, pos: Vector2<i32>, level: i8) -> bool {
         self.0.defer_ticket_release(pos, level);
         true

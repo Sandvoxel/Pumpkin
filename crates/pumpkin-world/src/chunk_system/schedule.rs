@@ -847,11 +847,23 @@ impl GenerationSchedule {
         }
     }
 
+    fn saves_chunks_at_tick_boundary(&self) -> bool {
+        self.level.upgrade().is_some_and(|level| {
+            level
+                .world_portal
+                .load()
+                .as_ref()
+                .as_ref()
+                .is_some_and(|portal| portal.saves_chunks_at_tick_boundary())
+        })
+    }
+
     fn process_unload_queue(&mut self) {
         if self.unload_chunks.is_empty() {
             return;
         }
 
+        let tick_boundary_saves = self.saves_chunks_at_tick_boundary();
         let mut unload_chunks = HashSetType::default();
         swap(&mut unload_chunks, &mut self.unload_chunks);
         let mut chunks = Vec::with_capacity(unload_chunks.len());
@@ -894,6 +906,7 @@ impl GenerationSchedule {
             self.graph.drop_edge_chain(holder.occupied_by);
             holder.occupied_by = EdgeKey::null();
 
+            let captured_at_tick_boundary = holder.public && tick_boundary_saves;
             if holder.public {
                 self.unpublish_chunk(pos);
                 holder.public = false;
@@ -903,7 +916,7 @@ impl GenerationSchedule {
                 match tmp {
                     Chunk::Level(chunk) => {
                         // Save chunk to disk if dirty
-                        if chunk.is_dirty() {
+                        if !captured_at_tick_boundary && chunk.is_dirty() {
                             chunks.push((
                                 pos,
                                 Chunk::Level(Arc::new(
@@ -941,12 +954,16 @@ impl GenerationSchedule {
     }
 
     fn save_all_chunk(&mut self, save_proto_chunk: bool) {
+        let tick_boundary_saves = self.saves_chunks_at_tick_boundary();
         let mut chunks = Vec::with_capacity(self.chunk_map.len());
 
         for (pos, holder) in &mut self.chunk_map {
             if let Some(chunk) = &holder.chunk {
                 let should_save = match chunk {
-                    Chunk::Level(sync_chunk) => sync_chunk.is_dirty(),
+                    // Published chunks must use the same snapshot as their live objects.
+                    Chunk::Level(sync_chunk) => {
+                        !(holder.public && tick_boundary_saves) && sync_chunk.is_dirty()
+                    }
                     Chunk::Proto(proto) => {
                         save_proto_chunk
                             && !matches!(

@@ -646,6 +646,98 @@ mod tests {
         },
     };
 
+    async fn read_saved_chunk(path: &std::path::Path) -> pumpkin_world::chunk::ChunkData {
+        use pumpkin_world::chunk::{
+            format::anvil::AnvilChunkFile,
+            io::{ChunkSerializer, LoadedData},
+        };
+        let region = AnvilChunkFile::<pumpkin_world::chunk::ChunkData>::load(path)
+            .await
+            .unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        region.get_chunks(vec![Vector2::new(0, 0)], sender).await;
+        let Some(LoadedData::Loaded(chunk)) = receiver.recv().await else {
+            panic!("saved chunk was not readable");
+        };
+        chunk
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn asynchronous_save_keeps_terrain_and_container_in_the_same_snapshot() {
+        use pumpkin_data::{Block, item::Item, item_stack::ItemStack};
+        use pumpkin_util::math::position::BlockPos;
+        use pumpkin_world::{chunk::ChunkData, chunk_system::ChunkLoading};
+        let folder = tempfile::tempdir().unwrap();
+        let level = Level::from_root_folder(
+            &pumpkin_config::world::LevelConfig::default(),
+            folder.path().to_path_buf(),
+            42,
+            Dimension::OVERWORLD,
+        );
+        let world = Arc::new(World::load(
+            level.clone(),
+            Arc::new(ArcSwap::from_pointee(LevelData::default(Seed(42)))),
+            Dimension::OVERWORLD,
+            crate::block::registry::default_registry(),
+            Weak::new(),
+        ));
+        level
+            .world_portal
+            .store(Arc::new(Some(Arc::new(super::super::WorldPortal(
+                world.clone(),
+            )))));
+        let pos = Vector2::new(0, 0);
+        let initial = ChunkData::empty_sync(0, 0);
+        initial.mark_dirty(true);
+        initial.light_populated.store(true, Ordering::Relaxed);
+        level
+            .chunk_saver
+            .save_chunks(&level.level_folder, vec![(pos, initial)])
+            .await
+            .unwrap();
+        {
+            let mut loading = level.chunk_loading.lock().unwrap();
+            loading.add_ticket(pos, ChunkLoading::FULL_CHUNK_LEVEL);
+            loading.send_change();
+        };
+        let chunk = level.get_or_fetch_chunk(pos, Arc::clone).await.unwrap();
+        let chest_pos = BlockPos::new(1, 64, 1);
+        level.set_block_state(&chest_pos, Block::CHEST.default_state.id);
+        let chest = Arc::new(crate::block::entities::chest::ChestBlockEntity::new(
+            chest_pos,
+        ));
+        chest.items.write().unwrap()[0] = ItemStack::new(4, &Item::DIAMOND);
+        world.add_block_entity(chest.clone());
+        let snapshot = world.capture_save(SaveMode::Autosave, None, Vec::new());
+        chest.items.write().unwrap()[0] = ItemStack::new(7, &Item::DIAMOND);
+        level.set_block_state(&BlockPos::new(2, 64, 1), Block::STONE.default_state.id);
+        world.persist_snapshot(&snapshot).await.unwrap();
+        let path = level.level_folder.region_folder.join("r.0.0.mca");
+        let saved = read_saved_chunk(&path).await;
+        assert_eq!(
+            saved.section.get_block_absolute_y(2, 64, 1),
+            Some(Block::AIR.default_state.id)
+        );
+        let mut loaded = crate::block::entities::block_entity_from_generic::<
+            crate::block::entities::chest::ChestBlockEntity,
+        >(&saved.pending_block_entities.lock().unwrap()[&chest_pos]);
+        assert_eq!(loaded.items.get_mut().unwrap()[0].item_count, 4);
+        let newer = world.capture_save(SaveMode::Manual, None, Vec::new());
+        assert!(chunk.is_dirty() || !newer.terrain.is_empty());
+        world.persist_snapshot(&newer).await.unwrap();
+        let saved = read_saved_chunk(&path).await;
+        assert_eq!(
+            saved.section.get_block_absolute_y(2, 64, 1),
+            Some(Block::STONE.default_state.id)
+        );
+        let mut loaded = crate::block::entities::block_entity_from_generic::<
+            crate::block::entities::chest::ChestBlockEntity,
+        >(&saved.pending_block_entities.lock().unwrap()[&chest_pos]);
+        assert_eq!(loaded.items.get_mut().unwrap()[0].item_count, 7);
+        level.shutdown().await;
+        level.world_portal.store(Arc::new(None));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn metadata_snapshot_survives_mutation_and_failed_save_retry() {
         let folder = tempfile::tempdir().unwrap();

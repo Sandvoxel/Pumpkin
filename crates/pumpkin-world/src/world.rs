@@ -53,6 +53,10 @@ impl std::fmt::Display for GetBlockError {
 }
 
 pub trait WorldPortalExt: Send + Sync {
+    fn saves_chunks_at_tick_boundary(&self) -> bool {
+        false
+    }
+
     fn defer_ticket_release(
         &self,
         _pos: pumpkin_util::math::vector2::Vector2<i32>,
