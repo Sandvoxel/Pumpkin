@@ -146,6 +146,11 @@ pub struct ProtoChunk {
     pub blending_data: Option<crate::generation::blender::blending_data::BlendingData>,
     pub pending_block_entities: Vec<NbtCompound>,
     pending_structure_entities: Vec<NbtCompound>,
+    pub block_ticks: Vec<ScheduledTick<&'static Block>>,
+    pub preserved_tags: NbtCompound,
+    pub custom_data: NbtCompound,
+    pub inhabited_time: u64,
+    pub last_update: i64,
     pub fluid_ticks: Vec<ScheduledTick<&'static Fluid>>,
 }
 
@@ -255,16 +260,43 @@ impl ProtoChunk {
             pending_block_entities: Vec::new(),
             pending_structure_entities: Vec::new(),
             fluid_ticks: Vec::new(),
+            block_ticks: Vec::new(),
+            preserved_tags: NbtCompound::new(),
+            custom_data: NbtCompound::new(),
+            inhabited_time: 0,
+            last_update: 0,
         }
     }
 
     #[must_use]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Restores palettes, heightmaps and retained storage state"
+    )]
     pub fn from_chunk_data(
         chunk_data: &ChunkData,
         generator: &super::generator::WorldGenerator,
     ) -> Self {
         let mut proto_chunk = Self::new(chunk_data.x, chunk_data.z, generator);
 
+        proto_chunk.block_ticks = chunk_data.block_ticks.to_vec();
+        proto_chunk.fluid_ticks = chunk_data.fluid_ticks.to_vec();
+        proto_chunk.preserved_tags = chunk_data
+            .preserved_tags
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        proto_chunk.custom_data = chunk_data
+            .custom_data
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        proto_chunk.inhabited_time = chunk_data
+            .inhabited_time
+            .load(std::sync::atomic::Ordering::Relaxed);
+        proto_chunk.last_update = chunk_data
+            .last_update
+            .load(std::sync::atomic::Ordering::Relaxed);
         proto_chunk.light = chunk_data
             .light_engine
             .lock()

@@ -289,6 +289,7 @@ impl Chunk {
                 dirty: AtomicBool::new(false),
                 save_generation: std::sync::atomic::AtomicU64::new(0),
                 inhabited_time: AtomicU64::new(0),
+                last_update: std::sync::atomic::AtomicI64::new(0),
                 custom_data: Mutex::new(NbtCompound::new()),
                 preserved_tags: Mutex::new(NbtCompound::new()),
             })),
@@ -332,14 +333,15 @@ impl Chunk {
             z: proto_chunk.z,
             dirty: AtomicBool::new(true),
             save_generation: std::sync::atomic::AtomicU64::new(0),
-            block_ticks: ChunkTickScheduler::default(),
+            block_ticks: ChunkTickScheduler::from_iter(proto_chunk.block_ticks),
             fluid_ticks: ChunkTickScheduler::from_iter(proto_chunk.fluid_ticks),
             pending_block_entities: Mutex::new(pending_block_entities),
             status: proto_chunk.stage.into(),
             blending_data: proto_chunk.blending_data,
-            inhabited_time: AtomicU64::new(0),
-            custom_data: Mutex::new(NbtCompound::new()),
-            preserved_tags: Mutex::new(NbtCompound::new()),
+            inhabited_time: AtomicU64::new(proto_chunk.inhabited_time),
+            last_update: std::sync::atomic::AtomicI64::new(proto_chunk.last_update),
+            custom_data: Mutex::new(proto_chunk.custom_data),
+            preserved_tags: Mutex::new(proto_chunk.preserved_tags),
         };
 
         *self = Self::Level(Arc::new(chunk));

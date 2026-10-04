@@ -151,7 +151,11 @@ impl World {
         let mut sources = Vec::new();
         for entry in self.level.loaded_chunks.iter() {
             if included(entry.key()) && entry.value().take_dirty() {
-                terrain.push((*entry.key(), Arc::new(entry.value().snapshot(generation))));
+                let chunk = entry.value().snapshot(generation);
+                chunk
+                    .last_update
+                    .store(self.get_world_age(), Ordering::Relaxed);
+                terrain.push((*entry.key(), Arc::new(chunk)));
                 sources.push(Arc::downgrade(entry.value()));
             }
         }
@@ -293,6 +297,8 @@ impl World {
         }
         for pos in unloading {
             self.block_entities.remove(pos);
+            self.retained_block_entity_data
+                .retain(|position, _| position.chunk_position() != *pos);
         }
         self.save_state
             .unloaded_snapshots

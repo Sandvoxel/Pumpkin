@@ -90,6 +90,7 @@ impl ToFromWasmEvent for ChunkLoad {
                     dirty: std::sync::atomic::AtomicBool::new(false),
                     save_generation: std::sync::atomic::AtomicU64::new(0),
                     inhabited_time: std::sync::atomic::AtomicU64::new(0),
+                    last_update: std::sync::atomic::AtomicI64::new(0),
                     custom_data: std::sync::Mutex::new(pumpkin_nbt::compound::NbtCompound::new()),
                     preserved_tags: std::sync::Mutex::new(pumpkin_nbt::compound::NbtCompound::new()),
                 };
@@ -145,6 +146,7 @@ impl ToFromWasmEvent for ChunkSave {
                     dirty: std::sync::atomic::AtomicBool::new(false),
                     save_generation: std::sync::atomic::AtomicU64::new(0),
                     inhabited_time: std::sync::atomic::AtomicU64::new(0),
+                    last_update: std::sync::atomic::AtomicI64::new(0),
                     custom_data: std::sync::Mutex::new(pumpkin_nbt::compound::NbtCompound::new()),
                     preserved_tags: std::sync::Mutex::new(pumpkin_nbt::compound::NbtCompound::new()),
                 };
@@ -196,6 +198,7 @@ impl ToFromWasmEvent for ChunkSend {
                     dirty: std::sync::atomic::AtomicBool::new(false),
                     save_generation: std::sync::atomic::AtomicU64::new(0),
                     inhabited_time: std::sync::atomic::AtomicU64::new(0),
+                    last_update: std::sync::atomic::AtomicI64::new(0),
                     custom_data: std::sync::Mutex::new(pumpkin_nbt::compound::NbtCompound::new()),
                     preserved_tags: std::sync::Mutex::new(pumpkin_nbt::compound::NbtCompound::new()),
                 };

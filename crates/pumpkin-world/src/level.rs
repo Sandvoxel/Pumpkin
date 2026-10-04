@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use std::{
     path::PathBuf,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, Ordering},
     thread,
 };
 use tokio::time::timeout;
@@ -82,7 +82,7 @@ pub struct Level {
     pub lighting_config: LightingEngineConfig,
 
     /// Counts the number of ticks that have been scheduled for this world
-    schedule_tick_counts: AtomicU64,
+    schedule_tick_counts: std::sync::atomic::AtomicI64,
 
     // Chunks that are paired with chunk watchers. When a chunk is no longer watched, it is removed
     // from the loaded chunks map and sent to the underlying ChunkIO
@@ -278,7 +278,7 @@ impl Level {
             light_engine: DynamicLightEngine::new(dim_min_y, dim_min_y + dim_height),
             chunk_saver,
             entity_saver,
-            schedule_tick_counts: AtomicU64::new(0),
+            schedule_tick_counts: std::sync::atomic::AtomicI64::new(0),
             loaded_chunks: Arc::new(DashMap::new()),
             loaded_chunk_changes: Arc::new(SegQueue::new()),
             loaded_entity_chunks: Arc::new(DashMap::new()),
@@ -331,6 +331,8 @@ impl Level {
                 x: pos.x,
                 z: pos.y,
                 data: std::sync::Mutex::new(Vec::new()),
+                unsupported: std::sync::Mutex::new(Vec::new()),
+                preserved_tags: std::sync::Mutex::new(pumpkin_nbt::compound::NbtCompound::new()),
                 live: AtomicBool::new(false),
                 dirty: AtomicBool::new(false),
                 save_generation: std::sync::atomic::AtomicU64::new(0),
@@ -1002,7 +1004,7 @@ impl Level {
         &self,
         block: &Block,
         block_pos: BlockPos,
-        delay: u8,
+        delay: i32,
         priority: TickPriority,
     ) {
         let tick_order = self.schedule_tick_counts.fetch_add(1, Ordering::Relaxed);
@@ -1029,7 +1031,7 @@ impl Level {
         &self,
         fluid: &Fluid,
         block_pos: BlockPos,
-        delay: u8,
+        delay: i32,
         priority: TickPriority,
     ) {
         let tick_order = self.schedule_tick_counts.fetch_add(1, Ordering::Relaxed);

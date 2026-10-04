@@ -43,13 +43,12 @@ const MODELLED_ROOT_TAGS: &[&str] = &[
     "yPos",
     "zPos",
     "Status",
-    "Heightmaps",
-    "sections",
     "block_entities",
     "block_ticks",
     "fluid_ticks",
     "isLightOn",
     "InhabitedTime",
+    "LastUpdate",
     "PumpkinCustomData",
     "BukkitValues",
 ];
@@ -219,7 +218,7 @@ where
     let x = nbt.get_int("x")?;
     let y = nbt.get_int("y")?;
     let z = nbt.get_int("z")?;
-    let delay = nbt.get_int("t")? as u8;
+    let delay = nbt.get_int("t")?;
     let priority = TickPriority::try_from(nbt.get_int("p")?).ok()?;
     let res_loc_str = nbt.get_string("i")?;
     let res_loc = ResourceLocation::from_str(res_loc_str).ok()?;
@@ -230,6 +229,82 @@ where
         position: BlockPos::new(x, y, z),
         value,
     })
+}
+
+fn saved_heightmaps(
+    sections: &[BlockPalette],
+    status: ChunkStatus,
+    mut retained: NbtCompound,
+) -> NbtCompound {
+    use super::ChunkHeightmapType;
+    use pumpkin_nbt::tag::NbtTag;
+    for name in [
+        "WORLD_SURFACE_WG",
+        "OCEAN_FLOOR_WG",
+        "WORLD_SURFACE",
+        "OCEAN_FLOOR",
+        "MOTION_BLOCKING",
+        "MOTION_BLOCKING_NO_LEAVES",
+    ] {
+        retained.child_tags.remove(name);
+    }
+    let types: &[(&str, Option<ChunkHeightmapType>)] = match status {
+        ChunkStatus::Empty
+        | ChunkStatus::StructureStarts
+        | ChunkStatus::StructureReferences
+        | ChunkStatus::Biomes => &[
+            ("WORLD_SURFACE_WG", Some(ChunkHeightmapType::WorldSurface)),
+            ("OCEAN_FLOOR_WG", None),
+        ],
+        _ => &[
+            ("WORLD_SURFACE", Some(ChunkHeightmapType::WorldSurface)),
+            ("OCEAN_FLOOR", None),
+            ("MOTION_BLOCKING", Some(ChunkHeightmapType::MotionBlocking)),
+            (
+                "MOTION_BLOCKING_NO_LEAVES",
+                Some(ChunkHeightmapType::MotionBlockingNoLeaves),
+            ),
+        ],
+    };
+    let height = sections.len() * BlockPalette::SIZE;
+    let bits = ((usize::BITS - height.leading_zeros()) as usize).max(1);
+    let per_long = 64 / bits;
+    let mut packed = vec![vec![0i64; 256usize.div_ceil(per_long)]; types.len()];
+    for z in 0..16 {
+        for x in 0..16 {
+            let mut remaining = types.len();
+            let mut found = vec![false; types.len()];
+            for y in (0..height).rev() {
+                let state = pumpkin_data::BlockState::from_id(sections[y / 16].get(x, y % 16, z));
+                for (map, (_, kind)) in types.iter().enumerate() {
+                    if !found[map]
+                        && kind.map_or_else(
+                            || {
+                                pumpkin_data::block_properties::blocks_movement(
+                                    state,
+                                    state.id.to_block_id(),
+                                )
+                            },
+                            |kind| kind.is_opaque(state),
+                        )
+                    {
+                        let index = z * 16 + x;
+                        packed[map][index / per_long] |=
+                            ((y + 1) as i64) << ((index % per_long) * bits);
+                        found[map] = true;
+                        remaining -= 1;
+                    }
+                }
+                if remaining == 0 {
+                    break;
+                }
+            }
+        }
+    }
+    for ((name, _), packed) in types.iter().zip(packed) {
+        retained.put(name, NbtTag::LongArray(packed));
+    }
+    retained
 }
 
 impl ChunkData {
@@ -281,7 +356,9 @@ impl ChunkData {
         let mut max_y_section = min_y_section as i8;
         if let Some(sections_list) = root_tag.get_list("sections") {
             for section_tag in sections_list {
-                if let pumpkin_nbt::tag::NbtTag::Compound(section_compound) = section_tag {
+                if let pumpkin_nbt::tag::NbtTag::Compound(section_compound) = section_tag
+                    && (section_compound.has("block_states") || section_compound.has("biomes"))
+                {
                     let y = section_y(section_compound) as i8;
                     if y > max_y_section {
                         max_y_section = y;
@@ -481,6 +558,9 @@ impl ChunkData {
             status,
             blending_data: None,
             inhabited_time: AtomicU64::new(root_tag.get_long("InhabitedTime").unwrap_or(0) as u64),
+            last_update: std::sync::atomic::AtomicI64::new(
+                root_tag.get_long("LastUpdate").unwrap_or(0),
+            ),
             custom_data: std::sync::Mutex::new(custom_data),
             preserved_tags: std::sync::Mutex::new(preserved_root_tags(&root_tag)),
         })
@@ -513,10 +593,6 @@ impl ChunkData {
             .light_engine
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let heightmap_lock = self
-            .heightmap
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let block_lock = self
             .section
             .block_sections
@@ -546,6 +622,7 @@ impl ChunkData {
             }
         }
 
+        root_compound.put_long("LastUpdate", self.last_update.load(Ordering::Relaxed));
         root_compound.put_int("DataVersion", WORLD_DATA_VERSION);
         root_compound.put_int("xPos", self.x);
         root_compound.put_int("zPos", self.z);
@@ -565,27 +642,43 @@ impl ChunkData {
         };
         root_compound.put_string("Status", status_str.to_string());
 
-        let mut heightmaps_compound = NbtCompound::new();
-        if let Some(ref arr) = heightmap_lock.world_surface {
-            heightmaps_compound.put("WORLD_SURFACE", NbtTag::LongArray(arr.to_vec()));
-        }
-        if let Some(ref arr) = heightmap_lock.motion_blocking {
-            heightmaps_compound.put("MOTION_BLOCKING", NbtTag::LongArray(arr.to_vec()));
-        }
-        if let Some(ref arr) = heightmap_lock.motion_blocking_no_leaves {
-            heightmaps_compound.put("MOTION_BLOCKING_NO_LEAVES", NbtTag::LongArray(arr.to_vec()));
-        }
-        root_compound.put_compound("Heightmaps", heightmaps_compound);
+        root_compound.put_compound(
+            "Heightmaps",
+            saved_heightmaps(
+                &block_lock,
+                self.status,
+                root_compound
+                    .get_compound("Heightmaps")
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+        );
 
         let mut sections_list = Vec::new();
         for i in 0..self.section.count {
-            let mut section_comp = NbtCompound::new();
             let y_val = i as i8 + min_section_y;
+            let mut section_comp = root_compound
+                .get_list("sections")
+                .and_then(|sections| {
+                    sections.iter().find_map(|tag| match tag {
+                        NbtTag::Compound(section) if section_y(section) == i32::from(y_val) => {
+                            Some(section.clone())
+                        }
+                        _ => None,
+                    })
+                })
+                .unwrap_or_default();
+            section_comp.child_tags.remove("BlockLight");
+            section_comp.child_tags.remove("SkyLight");
             section_comp.put_byte("Y", y_val);
 
             // block_states
             let block_states_nbt = block_lock[i].to_disk_nbt();
-            let mut bs_comp = NbtCompound::new();
+            let mut bs_comp = section_comp
+                .get_compound("block_states")
+                .cloned()
+                .unwrap_or_default();
+            bs_comp.child_tags.remove("data");
             if let Some(ref data_arr) = block_states_nbt.data {
                 bs_comp.put("data", NbtTag::LongArray(data_arr.to_vec()));
             }
@@ -619,7 +712,11 @@ impl ChunkData {
 
             // biomes
             let biomes_nbt = biome_lock[i].to_disk_nbt();
-            let mut b_comp = NbtCompound::new();
+            let mut b_comp = section_comp
+                .get_compound("biomes")
+                .cloned()
+                .unwrap_or_default();
+            b_comp.child_tags.remove("data");
             if let Some(ref data_arr) = biomes_nbt.data {
                 b_comp.put("data", NbtTag::LongArray(data_arr.to_vec()));
             }
@@ -654,6 +751,20 @@ impl ChunkData {
 
             sections_list.push(NbtTag::Compound(section_comp));
         }
+        if let Some(previous) = root_compound.get_list("sections") {
+            sections_list.extend(
+                previous
+                    .iter()
+                    .filter(|tag| match tag {
+                        NbtTag::Compound(section) => {
+                            let y = section_y(section) - i32::from(min_section_y);
+                            y < 0 || y >= self.section.count as i32
+                        }
+                        _ => true,
+                    })
+                    .cloned(),
+            );
+        }
         root_compound.put_list("sections", sections_list);
 
         let mut block_ticks_list = Vec::new();
@@ -662,7 +773,7 @@ impl ChunkData {
             tick_comp.put_int("x", tick.position.0.x);
             tick_comp.put_int("y", tick.position.0.y);
             tick_comp.put_int("z", tick.position.0.z);
-            tick_comp.put_int("t", tick.delay as i32);
+            tick_comp.put_int("t", tick.delay);
             tick_comp.put_int("p", tick.priority as i32);
             tick_comp.put_string("i", tick.value.to_resource_location());
             block_ticks_list.push(NbtTag::Compound(tick_comp));
@@ -675,7 +786,7 @@ impl ChunkData {
             tick_comp.put_int("x", tick.position.0.x);
             tick_comp.put_int("y", tick.position.0.y);
             tick_comp.put_int("z", tick.position.0.z);
-            tick_comp.put_int("t", tick.delay as i32);
+            tick_comp.put_int("t", tick.delay);
             tick_comp.put_int("p", tick.priority as i32);
             tick_comp.put_string("i", tick.value.to_resource_location());
             fluid_ticks_list.push(NbtTag::Compound(tick_comp));
@@ -864,10 +975,22 @@ impl ChunkEntityData {
             _ => Vec::new(),
         };
 
+        let mut retained = nbt.root_tag;
+        for name in [
+            "Entities",
+            "Position",
+            "Position-X",
+            "Position-Z",
+            "DataVersion",
+        ] {
+            retained.child_tags.remove(name);
+        }
         Ok(Self {
             x: position.x,
             z: position.y,
             data: std::sync::Mutex::new(entities),
+            unsupported: std::sync::Mutex::new(Vec::new()),
+            preserved_tags: std::sync::Mutex::new(retained),
             live: AtomicBool::new(false),
             dirty: AtomicBool::new(false),
             save_generation: std::sync::atomic::AtomicU64::new(0),
@@ -875,19 +998,33 @@ impl ChunkEntityData {
     }
 
     fn internal_to_bytes(&self) -> Bytes {
-        let mut root = NbtCompound::new();
+        let mut root = self
+            .preserved_tags
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        root.child_tags.remove("Position-X");
+        root.child_tags.remove("Position-Z");
         root.put_int("DataVersion", WORLD_DATA_VERSION);
         root.put(
             "Position",
             pumpkin_nbt::tag::NbtTag::IntArray(vec![self.x, self.z]),
         );
-        let entities_tag: Vec<pumpkin_nbt::tag::NbtTag> = self
+        let mut entities_tag: Vec<pumpkin_nbt::tag::NbtTag> = self
             .data
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .map(|c| pumpkin_nbt::tag::NbtTag::Compound(c.clone()))
             .collect();
+        entities_tag.extend(
+            self.unsupported
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .cloned()
+                .map(pumpkin_nbt::tag::NbtTag::Compound),
+        );
         root.put_list("Entities", entities_tag);
 
         let nbt = pumpkin_nbt::Nbt::from(root);
@@ -1068,6 +1205,51 @@ mod tests {
             NbtTag::List(sections.into_iter().map(NbtTag::Compound).collect()),
         );
         pumpkin_nbt::Nbt::new(String::new(), root)
+    }
+
+    #[test]
+    fn section_tags_and_current_heightmaps_survive_snapshot_save() {
+        let mut section = test_section(-4, "minecraft:air", true);
+        section.put_string("example:section", "keep".into());
+        let nbt = test_chunk(vec![section]);
+        let chunk = ChunkData::from_bytes(&nbt.write(), Vector2::new(0, 0)).unwrap();
+        chunk.set_block_absolute_y(0, -64, 0, Block::STONE.default_state.id);
+        chunk.set_block_absolute_y(0, -63, 0, Block::WATER.default_state.id);
+        let snapshot = chunk.snapshot(1);
+        let saved = snapshot.to_bytes().unwrap();
+        let mut cursor = std::io::Cursor::new(saved.as_ref());
+        let mut reader = pumpkin_nbt::deserializer::NbtReadHelperJava::new(&mut cursor);
+        let root = pumpkin_nbt::Nbt::read(&mut reader).unwrap().root_tag;
+        let section = root
+            .get_list("sections")
+            .unwrap()
+            .iter()
+            .find_map(|tag| match tag {
+                NbtTag::Compound(section) if section_y(section) == -4 => Some(section),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(section.get_string("example:section"), Some("keep"));
+        let heights = root.get_compound("Heightmaps").unwrap();
+        // Vanilla SimpleBitStorage uses five bits for a one-section chunk.
+        assert_eq!(
+            heights
+                .get("WORLD_SURFACE")
+                .unwrap()
+                .extract_long_array()
+                .unwrap()[0]
+                & 31,
+            2
+        );
+        assert_eq!(
+            heights
+                .get("OCEAN_FLOOR")
+                .unwrap()
+                .extract_long_array()
+                .unwrap()[0]
+                & 31,
+            1
+        );
     }
 
     #[test]

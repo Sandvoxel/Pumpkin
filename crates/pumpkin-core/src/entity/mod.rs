@@ -133,6 +133,14 @@ impl dyn EntityBase + '_ {
 
 pub trait EntityBase: Send + Sync + std::any::Any {
     fn write_nbt(&self, nbt: &mut NbtCompound) {
+        nbt.child_tags.extend(
+            self.get_entity()
+                .retained_nbt
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .child_tags
+                .clone(),
+        );
         self.get_entity().write_nbt(nbt);
         if let Some(living) = self.get_living_entity() {
             living.write_living_nbt(nbt);
@@ -148,6 +156,21 @@ pub trait EntityBase: Send + Sync + std::any::Any {
             living.read_living_nbt_non_mut(nbt);
         }
         self.read_custom_nbt(nbt);
+        let mut modeled = NbtCompound::new();
+        self.get_entity().write_nbt(&mut modeled);
+        if let Some(living) = self.get_living_entity() {
+            living.write_living_nbt(&mut modeled);
+        }
+        self.write_custom_nbt(&mut modeled);
+        let mut retained = nbt.clone();
+        retained
+            .child_tags
+            .retain(|name, _| !modeled.child_tags.contains_key(name));
+        *self
+            .get_entity()
+            .retained_nbt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = retained;
     }
 
     fn read_custom_nbt(&self, _nbt: &NbtCompound) {}
@@ -970,6 +993,7 @@ pub struct Entity {
     pub last_sent_velocity: AtomicCell<Vector3<f64>>,
     /// Persistent custom data container for plugins
     pub custom_data: std::sync::Mutex<NbtCompound>,
+    pub retained_nbt: std::sync::Mutex<NbtCompound>,
 }
 
 impl Entity {
@@ -1095,6 +1119,7 @@ impl Entity {
             last_sent_pos: AtomicCell::new(position),
             last_sent_velocity: AtomicCell::new(Vector3::default()),
             custom_data: std::sync::Mutex::new(NbtCompound::new()),
+            retained_nbt: std::sync::Mutex::new(NbtCompound::new()),
         }
     }
 

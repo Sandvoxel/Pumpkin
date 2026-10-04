@@ -8,8 +8,6 @@ use pumpkin_util::{
 
 pub mod scheduler;
 
-const MAX_TICK_DELAY: usize = 1 << 8;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd)]
 #[repr(i32)]
 pub enum TickPriority {
@@ -58,7 +56,7 @@ impl TryFrom<i32> for TickPriority {
 
 #[derive(Clone)]
 pub struct ScheduledTick<T> {
-    pub delay: u8,
+    pub delay: i32,
     pub priority: TickPriority,
     pub position: BlockPos,
     pub value: T,
@@ -67,7 +65,7 @@ pub struct ScheduledTick<T> {
 #[derive(Clone)]
 pub struct OrderedTick<T> {
     pub priority: TickPriority,
-    pub sub_tick_order: u64,
+    pub sub_tick_order: i64,
 
     pub position: BlockPos,
     pub value: T,
@@ -116,7 +114,7 @@ where
         nbt.put_int("x", self.position.0.x);
         nbt.put_int("y", self.position.0.y);
         nbt.put_int("z", self.position.0.z);
-        nbt.put_int("t", self.delay as i32);
+        nbt.put_int("t", self.delay);
         nbt.put_int("p", self.priority as i32);
         nbt.put_string("i", self.value.to_resource_location());
         nbt
@@ -132,7 +130,7 @@ where
         let x = nbt.get_int("x")?;
         let y = nbt.get_int("y")?;
         let z = nbt.get_int("z")?;
-        let delay = nbt.get_int("t")? as u8;
+        let delay = nbt.get_int("t")?;
         let priority = TickPriority::try_from(nbt.get_int("p")?).ok()?;
         let res_loc_str = nbt.get_string("i")?;
         let res_loc = ResourceLocation::from_str(res_loc_str).ok()?;

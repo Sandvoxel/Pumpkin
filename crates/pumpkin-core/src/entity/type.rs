@@ -129,13 +129,29 @@ use crate::world::World;
 use pumpkin_data::Block;
 use std::sync::atomic::AtomicBool;
 
-#[expect(clippy::too_many_lines)]
 pub fn from_type(
     entity_type: &'static EntityType,
     position: Vector3<f64>,
     world: &Arc<World>,
     uuid: Uuid,
 ) -> Arc<dyn EntityBase> {
+    try_from_type(entity_type, position, world, uuid).unwrap_or_else(|| {
+        let entity = Entity::from_uuid(uuid, world.clone(), position, entity_type);
+        if entity_type.attributes.is_empty() {
+            Arc::new(entity)
+        } else {
+            Arc::new(LivingEntity::new(entity))
+        }
+    })
+}
+
+#[expect(clippy::too_many_lines)]
+pub fn try_from_type(
+    entity_type: &'static EntityType,
+    position: Vector3<f64>,
+    world: &Arc<World>,
+    uuid: Uuid,
+) -> Option<Arc<dyn EntityBase>> {
     let entity = Entity::from_uuid(uuid, world.clone(), position, entity_type);
 
     let mob: Arc<dyn EntityBase> = match entity_type.id {
@@ -338,17 +354,10 @@ pub fn from_type(
         {
             Arc::new(BoatEntity::new(entity))
         }
-        // Fallback Entity
-        _ => {
-            if entity_type.attributes.is_empty() {
-                Arc::new(entity)
-            } else {
-                Arc::new(LivingEntity::new(entity))
-            }
-        }
+        _ => return None,
     };
 
-    mob
+    Some(mob)
 }
 
 #[expect(clippy::too_many_lines)]

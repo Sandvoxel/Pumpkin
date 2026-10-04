@@ -40,6 +40,7 @@ pub struct ItemStack {
     pub item_count: u8,
     pub item: &'static Item,
     pub patch: Vec<(DataComponent, Option<Box<dyn DataComponentImpl>>)>,
+    pub retained_components: Vec<(Box<str>, NbtTag)>,
 
     // unique ID for Bedrock network; don't serialize
     // Should always be a positive value for non-empty stacks
@@ -104,6 +105,7 @@ impl ItemStack {
             item_count,
             item,
             patch: Vec::new(),
+            retained_components: Vec::new(),
 
             uid: ITEM_STACK_ID_GEN.next_id(),
         }
@@ -119,6 +121,7 @@ impl ItemStack {
             item_count,
             item,
             patch: component,
+            retained_components: Vec::new(),
 
             uid: ITEM_STACK_ID_GEN.next_id(),
         }
@@ -133,6 +136,7 @@ impl ItemStack {
             item_count,
             item,
             patch: Vec::new(),
+            retained_components: Vec::new(),
 
             uid: match NonZero::new(1) {
                 Some(v) => v,
@@ -265,6 +269,7 @@ impl ItemStack {
         item_count: 0,
         item: &Item::AIR,
         patch: Vec::new(),
+        retained_components: Vec::new(),
 
         uid: NonZero::<i32>::MIN, // white lie - Bedrock `uid` is never sent if the stack is empty
     };
@@ -704,7 +709,15 @@ impl ItemStack {
     #[must_use]
     pub fn are_items_and_components_equal(&self, other: &Self) -> bool {
         // Items must match
-        if self.item != other.item {
+        if self.item != other.item
+            || self.retained_components.len() != other.retained_components.len()
+            || self.retained_components.iter().any(|(name, data)| {
+                !other
+                    .retained_components
+                    .iter()
+                    .any(|(other_name, other_data)| name == other_name && data == other_data)
+            })
+        {
             return false;
         }
 
@@ -807,10 +820,19 @@ impl ItemStack {
 
         // Create a tag compound for additional data
         let mut tag = NbtCompound::new();
-
+        for (name, data) in &self.retained_components {
+            if !matches!(data, NbtTag::End) {
+                tag.put(name, data.clone());
+            }
+        }
         for (id, data) in &self.patch {
+            tag.child_tags.remove(id.to_name());
+            tag.child_tags.remove(format!("!{}", id.to_name()).as_str());
             if let Some(data) = data {
-                tag.put(id.to_name(), data.write_data());
+                let value = data.write_data();
+                if !matches!(value, NbtTag::End) {
+                    tag.put(id.to_name(), value);
+                }
             } else {
                 let name = '!'.to_string() + id.to_name();
                 tag.put(name.as_str(), NbtCompound::new());
@@ -840,13 +862,28 @@ impl ItemStack {
         // Process any additional data in the components compound
         if let Some(tag) = compound.get_compound("components") {
             for (name, data) in &tag.child_tags {
-                if let Some(name) = name.strip_prefix("!") {
+                let key = name.strip_prefix('!').unwrap_or(name);
+                let Some(id) = DataComponent::try_from_name(key) else {
                     item_stack
-                        .patch
-                        .push((DataComponent::try_from_name(name)?, None));
+                        .retained_components
+                        .push((name.clone(), data.clone()));
+                    continue;
+                };
+                if name.starts_with('!') {
+                    item_stack.patch.push((id, None));
+                } else if let Some(component) = read_data(id, data) {
+                    let encoded = component.write_data();
+                    if matches!(encoded, NbtTag::End) || id == DataComponent::MapDecorations {
+                        item_stack
+                            .retained_components
+                            .push((name.clone(), data.clone()));
+                    } else {
+                        item_stack.patch.push((id, Some(component)));
+                    }
                 } else {
-                    let id = DataComponent::try_from_name(name)?;
-                    item_stack.patch.push((id, Some(read_data(id, data)?)));
+                    item_stack
+                        .retained_components
+                        .push((name.clone(), data.clone()));
                 }
             }
         }
@@ -880,6 +917,50 @@ mod tests {
     /// Helper: creates a fresh Iron Sword (max_damage 250, damage 0).
     fn iron_sword() -> ItemStack {
         ItemStack::new(1, &Item::IRON_SWORD)
+    }
+
+    #[test]
+    fn unsupported_components_survive_inventory_movement_and_owned_removal() {
+        let mut decorations = NbtCompound::new();
+        let mut marker = NbtCompound::new();
+        marker.put_string("type", "minecraft:red_x".into());
+        marker.put_double("x", -32.5);
+        marker.put_double("z", 64.0);
+        marker.put_float("rotation", 180.0);
+        decorations.put_compound("treasure", marker);
+        let mut components = NbtCompound::new();
+        components.put_compound("minecraft:map_decorations", decorations.clone());
+        components.put_string("example:unsupported", "payload".into());
+        let mut item = NbtCompound::new();
+        item.put_string("id", "minecraft:filled_map".into());
+        item.put_int("count", 2);
+        item.put_compound("components", components);
+        let mut stack = ItemStack::read_item_stack(&item).unwrap();
+        let mut moved = stack.split(1);
+        let mut saved = NbtCompound::new();
+        moved.write_item_stack(&mut saved);
+        assert_eq!(
+            saved
+                .get_compound("components")
+                .unwrap()
+                .get_compound("minecraft:map_decorations"),
+            Some(&decorations)
+        );
+        assert_eq!(
+            saved
+                .get_compound("components")
+                .unwrap()
+                .get_string("example:unsupported"),
+            Some("payload")
+        );
+        moved.remove_data_component(DataComponent::MapDecorations);
+        moved.write_item_stack(&mut saved);
+        let saved_components = saved.get_compound("components").unwrap();
+        assert!(!saved_components.has("minecraft:map_decorations"));
+        assert!(saved_components.has("!minecraft:map_decorations"));
+        let mut cursor = std::io::Cursor::new(pumpkin_nbt::Nbt::from(saved).write().to_vec());
+        let mut reader = pumpkin_nbt::deserializer::NbtReadHelperJava::new(&mut cursor);
+        assert!(pumpkin_nbt::Nbt::read(&mut reader).is_ok());
     }
 
     #[test]

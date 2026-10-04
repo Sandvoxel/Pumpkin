@@ -298,6 +298,7 @@ pub struct World {
     save_state: saving::SaveState,
     /// Persistent custom data for block entities at specific positions
     pub custom_block_entity_data: DashMap<BlockPos, NbtCompound>,
+    retained_block_entity_data: DashMap<BlockPos, NbtCompound>,
     /// Entity tracker responsible for tracking entity visibility and sending delta/status packets to watchers.
     pub entity_tracker: entity_tracker::EntityTracker,
 }
@@ -435,6 +436,7 @@ impl World {
             custom_data: std::sync::Mutex::new(custom_data),
             save_state: saving::SaveState::default(),
             custom_block_entity_data: DashMap::new(),
+            retained_block_entity_data: DashMap::new(),
             entity_tracker: entity_tracker::EntityTracker::new(),
         }
     }
@@ -606,7 +608,11 @@ impl World {
         };
 
         for block_entity in block_entities {
-            let mut nbt = NbtCompound::new();
+            let mut nbt = self
+                .retained_block_entity_data
+                .get(&block_entity.get_position())
+                .map(|data| data.clone())
+                .unwrap_or_default();
             block_entity.write_internal(&mut nbt);
             if let Some(custom_data) = self
                 .custom_block_entity_data
@@ -4232,15 +4238,18 @@ impl World {
                             .unwrap_or_else(std::sync::PoisonError::into_inner),
                     );
                     chunk.live.store(true, Relaxed);
+                    let mut unsupported = Vec::new();
                     for entity_nbt in &entity_nbts {
                         let Some(id) = entity_nbt.get_string("id") else {
                             debug!("Entity has no ID");
+                            unsupported.push(entity_nbt.clone());
                             continue;
                         };
                         let Some(entity_type) =
                             EntityType::from_name(id.strip_prefix("minecraft:").unwrap_or(id))
                         else {
                             warn!("Entity has no valid Entity Type {id}");
+                            unsupported.push(entity_nbt.clone());
                             continue;
                         };
 
@@ -4249,8 +4258,10 @@ impl World {
                         // fresh one if it is missing/corrupt.
                         let uuid = entity_nbt.get_uuid("UUID").unwrap_or_else(Uuid::new_v4);
                         // Pos is zero since it will be read from nbt.
-                        let entity =
-                            from_type(entity_type, Vector3::new(0.0, 0.0, 0.0), &world, uuid);
+                        let Some(entity) = crate::entity::r#type::try_from_type(entity_type, Vector3::new(0.0, 0.0, 0.0), &world, uuid) else {
+                            unsupported.push(entity_nbt.clone());
+                            continue;
+                        };
                         entity.read_nbt_non_mut(entity_nbt);
                         entity.init_data_tracker();
 
@@ -4265,6 +4276,7 @@ impl World {
                         world.add_entity_silent(entity.clone());
                         player.try_restore_vehicle(&entity);
                     }
+                    *chunk.unsupported.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = unsupported;
 
                 }
             }
@@ -5457,22 +5469,22 @@ impl World {
         &self,
         block: &Block,
         block_pos: BlockPos,
-        delay: u8,
+        delay: impl Into<i32>,
         priority: TickPriority,
     ) {
         self.level
-            .schedule_block_tick(block, block_pos, delay, priority);
+            .schedule_block_tick(block, block_pos, delay.into(), priority);
     }
 
     pub fn schedule_fluid_tick(
         &self,
         fluid: &Fluid,
         block_pos: BlockPos,
-        delay: u8,
+        delay: impl Into<i32>,
         priority: TickPriority,
     ) {
         self.level
-            .schedule_fluid_tick(fluid, block_pos, delay, priority);
+            .schedule_fluid_tick(fluid, block_pos, delay.into(), priority);
     }
 
     pub fn is_block_tick_scheduled(&self, block_pos: &BlockPos, block: &Block) -> bool {
@@ -6113,6 +6125,13 @@ impl World {
                 .insert(*block_pos, custom_data.clone());
         }
         let entity = block_entity_from_nbt(&nbt)?;
+        let mut modeled = NbtCompound::new();
+        entity.write_internal(&mut modeled);
+        let mut retained = nbt.clone();
+        retained
+            .child_tags
+            .retain(|name, _| !modeled.child_tags.contains_key(name));
+        self.retained_block_entity_data.insert(*block_pos, retained);
         self.block_entities
             .entry(chunk_pos)
             .or_default()
@@ -6234,6 +6253,7 @@ impl World {
     }
 
     pub fn remove_block_entity(&self, block_pos: &BlockPos) {
+        self.retained_block_entity_data.remove(block_pos);
         let chunk_pos = block_pos.chunk_position();
         let removed =
             self.block_entities

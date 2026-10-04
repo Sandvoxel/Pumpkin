@@ -82,6 +82,7 @@ pub struct ChunkData {
     pub dirty: AtomicBool,
     pub save_generation: AtomicU64,
     pub inhabited_time: AtomicU64,
+    pub last_update: std::sync::atomic::AtomicI64,
     pub custom_data: std::sync::Mutex<NbtCompound>,
     /// Root tags this server does not model, kept verbatim so a save does not
     /// strip them. A vanilla chunk carries `structures`, `PostProcessing`,
@@ -96,6 +97,8 @@ pub struct ChunkEntityData {
     /// Chunk Z
     pub z: i32,
     pub data: std::sync::Mutex<Vec<NbtCompound>>,
+    pub unsupported: std::sync::Mutex<Vec<NbtCompound>>,
+    pub preserved_tags: std::sync::Mutex<NbtCompound>,
     /// Set once the serialized entities have been consumed and spawned. From then on the
     /// live entity list is the source of truth and `data` is rebuilt from it on every save.
     pub live: AtomicBool,
@@ -685,6 +688,15 @@ impl ChunkData {
             dirty: AtomicBool::new(true),
             save_generation: AtomicU64::new(generation),
             inhabited_time: AtomicU64::new(self.inhabited_time.load(Ordering::Relaxed)),
+            last_update: std::sync::atomic::AtomicI64::new(
+                self.last_update.load(Ordering::Relaxed),
+            ),
+            preserved_tags: Mutex::new(
+                self.preserved_tags
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            ),
             custom_data: Mutex::new(
                 self.custom_data
                     .lock()
@@ -711,6 +723,7 @@ impl ChunkData {
             dirty: std::sync::atomic::AtomicBool::new(false),
             save_generation: std::sync::atomic::AtomicU64::new(0),
             inhabited_time: std::sync::atomic::AtomicU64::new(0),
+            last_update: std::sync::atomic::AtomicI64::new(0),
             custom_data: std::sync::Mutex::new(NbtCompound::new()),
             preserved_tags: std::sync::Mutex::new(NbtCompound::new()),
         }
@@ -1056,6 +1069,18 @@ impl ChunkEntityData {
             z: self.z,
             data: Mutex::new(
                 self.data
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            ),
+            unsupported: Mutex::new(
+                self.unsupported
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            ),
+            preserved_tags: Mutex::new(
+                self.preserved_tags
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone(),

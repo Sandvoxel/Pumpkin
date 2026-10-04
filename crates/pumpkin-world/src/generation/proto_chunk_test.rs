@@ -198,6 +198,11 @@ mod test {
         chest.put_int("y", 64);
         chest.put_int("z", -31);
         proto.add_block_entity(chest);
+        proto
+            .preserved_tags
+            .put_string("example:root", "preserved".into());
+        proto.inhabited_time = 777;
+        proto.last_update = 9001;
 
         let mut staged = Chunk::Proto(Box::new(proto));
         staged.upgrade_to_level_chunk(&Dimension::OVERWORLD, &LightingEngineConfig::Default);
@@ -218,6 +223,26 @@ mod test {
             unreachable!()
         };
         assert_eq!(chunk_again.pending_block_entities.lock().unwrap().len(), 1);
+        assert_eq!(
+            chunk_again
+                .preserved_tags
+                .lock()
+                .unwrap()
+                .get_string("example:root"),
+            Some("preserved")
+        );
+        assert_eq!(
+            chunk_again
+                .inhabited_time
+                .load(std::sync::atomic::Ordering::Relaxed),
+            777
+        );
+        assert_eq!(
+            chunk_again
+                .last_update
+                .load(std::sync::atomic::Ordering::Relaxed),
+            9001
+        );
     }
 
     // Regression test for transposed heightmaps during Noise-stage chunk resume.
