@@ -80,7 +80,7 @@ fn set_size(
             return Err(ERROR_TOO_BIG.create_without_context());
         }
 
-        let speed = (time_in_ticks > 0).then(|| time_in_ticks * 50); // ticks to milliseconds
+        let speed = (time_in_ticks > 0).then_some(time_in_ticks);
 
         border.set_diameter(&world, distance, speed);
         (current, (distance - current) as i32)
@@ -193,7 +193,7 @@ fn set_damage_amount(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    if (border.damage_per_block - damage_per_block).abs() < f32::EPSILON {
+    if (border.damage_per_block - f64::from(damage_per_block)).abs() < f64::from(f32::EPSILON) {
         return Err(ERROR_SAME_DAMAGE_AMOUNT.create_without_context());
     }
 
@@ -218,7 +218,7 @@ fn set_damage_buffer(source: &CommandSource, distance: f32) -> Result<i32, Comma
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    if (border.buffer - distance).abs() < f32::EPSILON {
+    if (border.buffer - f64::from(distance)).abs() < f64::from(f32::EPSILON) {
         return Err(ERROR_SAME_DAMAGE_BUFFER.create_without_context());
     }
 

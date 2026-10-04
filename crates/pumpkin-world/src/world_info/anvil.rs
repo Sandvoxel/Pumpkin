@@ -6,11 +6,7 @@ use std::{
 };
 use tracing::error;
 
-use pumpkin_nbt::{
-    compound::NbtCompound,
-    nbt_compress::{read_gzip_compound_tag, write_gzip_compound_tag},
-    tag::NbtTag,
-};
+use pumpkin_nbt::{compound::NbtCompound, nbt_compress::read_gzip_compound_tag, tag::NbtTag};
 use pumpkin_util::{Difficulty, world_seed::Seed};
 use serde::{Deserialize, Serialize};
 
@@ -18,10 +14,8 @@ use crate::world_info::{
     DataPacks, MAXIMUM_SUPPORTED_LEVEL_VERSION, MAXIMUM_SUPPORTED_WORLD_DATA_VERSION,
     MINIMUM_SUPPORTED_LEVEL_VERSION, MINIMUM_SUPPORTED_WORLD_DATA_VERSION, WorldVersion,
     data_files::{
-        find_overworld_data_file, minecraft_data_dir, read_game_rules, read_wandering_trader,
-        read_weather, read_world_clocks, read_world_gen_settings, write_custom_boss_events_stub,
-        write_game_rules, write_random_sequences_stub, write_scheduled_events_stub,
-        write_scoreboard_stub, write_stopwatches_stub, write_wandering_trader, write_weather,
+        find_overworld_data_file, overlay_compound, read_game_rules, read_weather,
+        read_world_clocks, read_world_gen_settings, write_game_rules, write_weather,
         write_world_clocks, write_world_gen_settings,
     },
     default_data_packs,
@@ -191,6 +185,9 @@ fn update_world_border_from_nbt(level_data: &mut LevelData, data: &NbtCompound) 
 
 fn update_spawn_from_nbt(level_data: &mut LevelData, data: &NbtCompound) {
     if let Some(spawn_comp) = data.get_compound("spawn") {
+        if let Some(dimension) = spawn_comp.get_string("dimension") {
+            level_data.spawn_dimension = dimension.to_string();
+        }
         if let Some(pos) = spawn_comp.get_int_array("pos")
             && pos.len() >= 3
         {
@@ -279,6 +276,7 @@ fn level_data_from_nbt(data: &NbtCompound, seed: i64) -> LevelData {
     if let Some(map_id) = data.get_int("map_id") {
         level_data.map_id = map_id;
     }
+    level_data.world_age = data.get_long("Time").unwrap_or(0);
     if let Some(day_time) = data.get_long("DayTime") {
         level_data.day_time = day_time;
     }
@@ -300,11 +298,16 @@ fn level_data_to_nbt(info: &LevelData, data: &mut NbtCompound) {
     data.put_long("BorderSizeLerpTime", info.border_size_lerp_time);
     data.put_double("BorderWarningBlocks", info.border_warning_blocks);
     data.put_double("BorderWarningTime", info.border_warning_time);
-    data.put_compound("DataPacks", data_packs_to_nbt(&info.data_packs));
+    let mut packs = data.get_compound("DataPacks").cloned().unwrap_or_default();
+    overlay_compound(&mut packs, data_packs_to_nbt(&info.data_packs));
+    data.put_compound("DataPacks", packs);
     data.put_int("DataVersion", info.data_version);
 
     // 26.2 difficulty_settings
-    let mut diff_comp = NbtCompound::new();
+    let mut diff_comp = data
+        .get_compound("difficulty_settings")
+        .cloned()
+        .unwrap_or_default();
     let diff_name = match info.difficulty {
         Difficulty::Peaceful => "peaceful",
         Difficulty::Easy => "easy",
@@ -312,7 +315,9 @@ fn level_data_to_nbt(info: &LevelData, data: &mut NbtCompound) {
         Difficulty::Hard => "hard",
     };
     diff_comp.put_string("difficulty", diff_name.to_string());
-    diff_comp.put_bool("hardcore", false);
+    if !diff_comp.child_tags.contains_key("hardcore") {
+        diff_comp.put_bool("hardcore", data.get_bool("hardcore").unwrap_or(false));
+    }
     diff_comp.put_bool("locked", info.difficulty_locked);
     data.put_compound("difficulty_settings", diff_comp);
 
@@ -322,8 +327,8 @@ fn level_data_to_nbt(info: &LevelData, data: &mut NbtCompound) {
     data.put_string("LevelName", info.level_name.clone());
 
     // 26.2 spawn
-    let mut spawn_comp = NbtCompound::new();
-    spawn_comp.put_string("dimension", "minecraft:overworld".to_string());
+    let mut spawn_comp = data.get_compound("spawn").cloned().unwrap_or_default();
+    spawn_comp.put_string("dimension", info.spawn_dimension.clone());
     spawn_comp.put(
         "pos",
         NbtTag::IntArray(vec![info.spawn_x, info.spawn_y, info.spawn_z]),
@@ -337,7 +342,10 @@ fn level_data_to_nbt(info: &LevelData, data: &mut NbtCompound) {
     data.put_int("SpawnZ", info.spawn_z);
     data.put_float("SpawnAngle", info.spawn_yaw);
     data.put_float("SpawnPitch", info.spawn_pitch);
-    data.put_compound("Version", world_version_to_nbt(&info.world_version));
+    let mut version = data.get_compound("Version").cloned().unwrap_or_default();
+    overlay_compound(&mut version, world_version_to_nbt(&info.world_version));
+    data.put_compound("Version", version);
+    data.put_long("Time", info.world_age);
     data.put_int("version", info.level_version);
     data.put_int("map_id", info.map_id);
     put_world_gen_settings_seed(data, info.world_gen_settings.seed);
@@ -401,20 +409,19 @@ impl WorldInfoReader for AnvilLevelInfo {
             level_data.game_rules = read_game_rules(level_folder);
         }
 
-        if minecraft_data_dir(level_folder)
-            .join("world_clocks.dat")
-            .exists()
-        {
-            let clocks = read_world_clocks(level_folder);
-            if let Some(overworld) = clocks.clocks.get("minecraft:overworld") {
-                level_data.day_time = overworld.total_ticks;
-            }
+        level_data.world_clocks = read_world_clocks(level_folder);
+        if let Some(overworld) = level_data.world_clocks.clocks.get("minecraft:overworld") {
+            level_data.day_time = overworld.total_ticks;
         }
-
-        // weather.dat
         if find_overworld_data_file(level_folder, "weather.dat").is_some() {
-            let weather = read_weather(level_folder);
-            level_data.clear_weather_time = weather.clear_weather_time;
+            level_data.weather = read_weather(level_folder);
+            level_data.clear_weather_time = level_data.weather.clear_weather_time;
+        } else {
+            level_data.weather.clear_weather_time = level_data.clear_weather_time;
+            level_data.weather.rain_time = data.get_int("rainTime").unwrap_or(0);
+            level_data.weather.thunder_time = data.get_int("thunderTime").unwrap_or(0);
+            level_data.weather.raining = data.get_bool("raining").unwrap_or(false);
+            level_data.weather.thundering = data.get_bool("thundering").unwrap_or(false);
         }
 
         Ok(level_data)
@@ -441,6 +448,9 @@ impl WorldInfoWriter for AnvilLevelInfo {
         let path_old = level_folder.join(LEVEL_DAT_BACKUP_FILE_NAME);
 
         let mut root = existing_level_dat_root(&path)?;
+        if path.try_exists()? && root.get_compound(LEVEL_DATA_TAG).is_none() {
+            return Err(WorldInfoError::DeserializationError("Missing Data".into()));
+        }
         let mut data_comp = root
             .get_compound(LEVEL_DATA_TAG)
             .cloned()
@@ -448,84 +458,30 @@ impl WorldInfoWriter for AnvilLevelInfo {
         level_data_to_nbt(&level_data, &mut data_comp);
         root.put_compound(LEVEL_DATA_TAG, data_comp);
 
-        write_gzip_compound_tag(root, File::create(&path_new)?)
+        let bytes = pumpkin_nbt::nbt_compress::write_gzip_compound_tag_to_bytes(root)
             .map_err(|e| WorldInfoError::SerializationError(e.to_string()))?;
+        super::atomic_write(&path_new, &bytes)?;
 
         if path.exists() {
-            fs::copy(&path, &path_old)?;
+            super::atomic_write(&path_old, &fs::read(&path)?)?;
         }
         fs::rename(&path_new, &path)?;
 
         let data_version = level_data.data_version;
-
-        // ── Write data/minecraft/*.dat files ─────────────────────────────────
-
-        // game_rules.dat
-        if let Err(e) = write_game_rules(level_folder, &info.game_rules, data_version) {
-            error!("Failed to write game_rules.dat: {e}");
-        }
-
-        // world_gen_settings.dat
-        if let Err(e) =
-            write_world_gen_settings(level_folder, &info.world_gen_settings, data_version)
-        {
-            error!("Failed to write world_gen_settings.dat: {e}");
-        }
-
-        // world_clocks.dat – persist the overworld day_time; preserve other
-        let mut clocks = read_world_clocks(level_folder);
+        write_game_rules(level_folder, &info.game_rules, data_version)?;
+        write_world_gen_settings(level_folder, &info.world_gen_settings, data_version)?;
+        let mut clocks = info.world_clocks.clone();
         clocks.data_version = data_version;
         clocks
             .clocks
             .entry("minecraft:overworld".to_string())
-            .and_modify(|c| c.total_ticks = info.day_time)
-            .or_insert(crate::world_info::data_files::DimensionClock {
-                total_ticks: info.day_time,
-            });
-
-        if let Err(e) = write_world_clocks(level_folder, &clocks) {
-            error!("Failed to write world_clocks.dat: {e}");
-        }
-
-        // weather.dat
-        let mut weather = read_weather(level_folder);
+            .or_default()
+            .total_ticks = info.day_time;
+        write_world_clocks(level_folder, &clocks)?;
+        let mut weather = info.weather.clone();
         weather.clear_weather_time = info.clear_weather_time;
         weather.data_version = data_version;
-        if let Err(e) = write_weather(level_folder, &weather) {
-            error!("Failed to write weather.dat: {e}");
-        }
-
-        // wandering_trader.dat (stub / load-save)
-        let mut wandering_trader = read_wandering_trader(level_folder);
-        wandering_trader.data_version = data_version;
-        if let Err(e) = write_wandering_trader(level_folder, &wandering_trader) {
-            error!("Failed to write wandering_trader.dat: {e}");
-        }
-
-        // custom_boss_events.dat
-        if let Err(e) = write_custom_boss_events_stub(level_folder, data_version) {
-            error!("Failed to write custom_boss_events.dat: {e}");
-        }
-
-        // scheduled_events.dat
-        if let Err(e) = write_scheduled_events_stub(level_folder, data_version) {
-            error!("Failed to write scheduled_events.dat: {e}");
-        }
-
-        // random_sequences.dat
-        if let Err(e) = write_random_sequences_stub(level_folder, data_version) {
-            error!("Failed to write random_sequences.dat: {e}");
-        }
-
-        // scoreboard.dat
-        if let Err(e) = write_scoreboard_stub(level_folder, data_version) {
-            error!("Failed to write scoreboard.dat: {e}");
-        }
-
-        // stopwatches.dat
-        if let Err(e) = write_stopwatches_stub(level_folder, data_version) {
-            error!("Failed to write stopwatches.dat: {e}");
-        }
+        write_weather(level_folder, &weather)?;
 
         Ok(())
     }
@@ -650,7 +606,10 @@ mod test {
             root.put_int("DataVersion", MAXIMUM_SUPPORTED_WORLD_DATA_VERSION);
             root.put_compound("data", data);
             write_gzip_compound_tag(root, File::create(paper_data.join(name))?)?;
-            fs::remove_file(minecraft_data_dir(directory.path()).join(name))?;
+            let root_path = minecraft_data_dir(directory.path()).join(name);
+            if root_path.try_exists()? {
+                fs::remove_file(root_path)?;
+            }
         }
         Ok(directory)
     }
@@ -749,7 +708,9 @@ mod test {
         write_gzip_compound_tag(root, File::create(&path)?)?;
         let original = fs::read(&path)?;
         let root_path = minecraft_data_dir(directory.path()).join("scheduled_events.dat");
-        fs::remove_file(&root_path)?;
+        if root_path.try_exists()? {
+            fs::remove_file(&root_path)?;
+        }
 
         let loaded = AnvilLevelInfo.read_world_info(directory.path())?;
         AnvilLevelInfo.write_world_info(&loaded, directory.path())?;
@@ -888,6 +849,21 @@ mod test {
     fn rewrite_level_dat_keeps_unmanaged_tags() {
         let temp_dir = TempDir::new().unwrap();
         write_level_dat(temp_dir.path(), converted_level_dat(Some(42)));
+        let mut root = read_level_dat(temp_dir.path());
+        root.put_int("unknown_root", 7);
+        let mut data = root.get_compound("Data").unwrap().clone();
+        let mut difficulty = NbtCompound::new();
+        difficulty.put_string("difficulty", "hard".to_string());
+        difficulty.put_bool("locked", false);
+        difficulty.put_bool("hardcore", true);
+        difficulty.put_int("unknown_difficulty", 8);
+        data.put_compound("difficulty_settings", difficulty);
+        let mut spawn = NbtCompound::new();
+        spawn.put_string("dimension", "minecraft:the_end".to_string());
+        spawn.put_int("unknown_spawn", 9);
+        data.put_compound("spawn", spawn);
+        root.put_compound("Data", data);
+        write_level_dat(temp_dir.path(), root);
 
         let mut level_data = AnvilLevelInfo.read_world_info(temp_dir.path()).unwrap();
         level_data.level_name = "Renamed World".to_string();
@@ -897,6 +873,13 @@ mod test {
 
         let root = read_level_dat(temp_dir.path());
         let data = root.get_compound("Data").unwrap();
+        assert_eq!(root.get_int("unknown_root"), Some(7));
+        let difficulty = data.get_compound("difficulty_settings").unwrap();
+        assert_eq!(difficulty.get_bool("hardcore"), Some(true));
+        assert_eq!(difficulty.get_int("unknown_difficulty"), Some(8));
+        let spawn = data.get_compound("spawn").unwrap();
+        assert_eq!(spawn.get_string("dimension"), Some("minecraft:the_end"));
+        assert_eq!(spawn.get_int("unknown_spawn"), Some(9));
         assert_eq!(data.get_bool("hardcore"), Some(true));
         assert_eq!(data.get_string("LevelName"), Some("Renamed World"));
         assert_eq!(
@@ -936,10 +919,7 @@ mod test {
         let game_rules_path = minecraft_data_dir(temp_dir.path()).join("game_rules.dat");
         let game_rules = read_gzip_compound_tag(File::open(game_rules_path).unwrap()).unwrap();
         assert_eq!(
-            game_rules
-                .get_compound("data")
-                .unwrap()
-                .get_int("DataVersion"),
+            game_rules.get_int("DataVersion"),
             Some(MAXIMUM_SUPPORTED_WORLD_DATA_VERSION)
         );
     }
@@ -973,6 +953,15 @@ mod test {
         original.border_center_x = 8.0;
         original.day_time = 12_345;
         original.map_id = 3;
+        original.weather.data_version = MAXIMUM_SUPPORTED_WORLD_DATA_VERSION;
+        original.world_clocks.data_version = MAXIMUM_SUPPORTED_WORLD_DATA_VERSION;
+        original.world_clocks.clocks.insert(
+            "minecraft:overworld".to_string(),
+            data_files::DimensionClock {
+                total_ticks: original.day_time,
+                ..Default::default()
+            },
+        );
 
         AnvilLevelInfo
             .write_world_info(&original, temp_dir.path())
@@ -1041,6 +1030,9 @@ mod test {
             border_warning_blocks: 5.0,
             border_warning_time: 15.0,
             clear_weather_time: 0,
+            world_age: 0,
+            weather: data_files::WeatherData::default(),
+            world_clocks: data_files::WorldClocksData::default(),
             data_packs: DataPacks {
                 disabled: vec![
                     "minecart_improvements".to_string(),
@@ -1091,6 +1083,7 @@ mod test {
             spawn_z: 160,
             spawn_yaw: 0.0,
             spawn_pitch: 0.0,
+            spawn_dimension: "minecraft:overworld".to_string(),
             level_version: 19133,
             world_version: WorldVersion {
                 name: "1.21.4".to_string(),
@@ -1203,7 +1196,7 @@ mod test {
     }
 
     #[test]
-    fn all_26_2_minecraft_data_files_written_and_read() {
+    fn supported_data_files_are_written_without_placeholders() {
         let temp_dir = TempDir::new().unwrap();
         let mut level_data = LEVEL_DAT.data.clone();
         level_data.data_version = 4903;
@@ -1218,14 +1211,8 @@ mod test {
         let data_dir = temp_dir.path().join("data").join("minecraft");
         let expected_files = [
             "game_rules.dat",
-            "random_sequences.dat",
-            "scoreboard.dat",
-            "stopwatches.dat",
-            "wandering_trader.dat",
             "world_clocks.dat",
             "world_gen_settings.dat",
-            "scheduled_events.dat",
-            "custom_boss_events.dat",
             "weather.dat",
         ];
 
@@ -1234,6 +1221,19 @@ mod test {
             assert!(
                 file_path.exists(),
                 "Expected file {file_name} to exist in data/minecraft/"
+            );
+        }
+        for name in [
+            "random_sequences.dat",
+            "scoreboard.dat",
+            "stopwatches.dat",
+            "wandering_trader.dat",
+            "scheduled_events.dat",
+            "custom_boss_events.dat",
+        ] {
+            assert!(
+                !data_dir.join(name).exists(),
+                "Unsupported saved data must not get a placeholder"
             );
         }
 

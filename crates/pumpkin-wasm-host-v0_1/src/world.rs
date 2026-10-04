@@ -1831,13 +1831,11 @@ impl pumpkin::plugin::world::HostWorldBorder for PluginHostState {
         border: Resource<WitWorldBorder>,
     ) -> wasmtime::Result<f64> {
         let border_res = self.get(&border)?;
-        Ok(f64::from(
-            border_res
-                .worldborder
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .buffer,
-        ))
+        Ok(border_res
+            .worldborder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .buffer)
     }
 
     async fn set_damage_buffer(
@@ -1850,7 +1848,7 @@ impl pumpkin::plugin::world::HostWorldBorder for PluginHostState {
             .worldborder
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .set_damage_buffer(buffer as f32);
+            .set_damage_buffer(buffer);
         Ok(())
     }
 
@@ -1859,13 +1857,11 @@ impl pumpkin::plugin::world::HostWorldBorder for PluginHostState {
         border: Resource<WitWorldBorder>,
     ) -> wasmtime::Result<f64> {
         let border_res = self.get(&border)?;
-        Ok(f64::from(
-            border_res
-                .worldborder
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .damage_per_block,
-        ))
+        Ok(border_res
+            .worldborder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .damage_per_block)
     }
 
     async fn set_damage_amount(
@@ -1878,7 +1874,7 @@ impl pumpkin::plugin::world::HostWorldBorder for PluginHostState {
             .worldborder
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .set_damage_per_block(damage as f32);
+            .set_damage_per_block(damage);
         Ok(())
     }
 

@@ -78,6 +78,7 @@ impl CommandExecutor for SetWorldSpawnExecutor {
         new_info.spawn_z = new_position.0.z;
         new_info.spawn_yaw = new_yaw;
         new_info.spawn_pitch = new_pitch;
+        new_info.spawn_dimension = world.dimension.minecraft_name.to_string();
 
         server.level_info.store(Arc::new(new_info));
 

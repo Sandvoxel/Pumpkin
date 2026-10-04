@@ -5,6 +5,13 @@ use pumpkin_world::{
     chunk::io::{Dirtiable, FileIO, next_save_generation},
     level::{SyncChunk, SyncEntityChunk},
     poi::PoiStorage,
+    world_info::{
+        LevelData,
+        data_files::{
+            DimensionClock, WeatherData, WorldBorderData, synchronize_world_info,
+            write_world_border,
+        },
+    },
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::{
@@ -40,6 +47,7 @@ pub(super) struct SaveState {
     unload_requests: Mutex<FxHashSet<Vector2<i32>>>,
     unloaded_snapshots: Mutex<FxHashSet<Vector2<i32>>>,
     committed: AtomicU64,
+    metadata_committed: Arc<AtomicU64>,
     ticket_releases: Mutex<Vec<(Vector2<i32>, i8)>>,
 }
 
@@ -53,10 +61,105 @@ struct Snapshot {
     live_entity_chunks: FxHashSet<Vector2<i32>>,
     poi: PoiStorage,
     custom_data: NbtCompound,
+    metadata: Option<LevelData>,
+    border: WorldBorderData,
     completions: Mutex<Vec<Completion>>,
 }
 
 impl World {
+    pub(crate) fn write_metadata_now(
+        &self,
+        writer: &dyn pumpkin_world::world_info::WorldInfoWriter,
+    ) -> Result<(), pumpkin_world::world_info::WorldInfoError> {
+        let _writer = self.save_state.writer.try_lock().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "A world save is already writing",
+            )
+        })?;
+        let generation = next_save_generation();
+        writer.write_world_info(
+            &self.snapshot_level_data(),
+            &self.level.level_folder.root_folder,
+        )?;
+        self.save_state
+            .metadata_committed
+            .fetch_max(generation, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn snapshot_level_data(&self) -> LevelData {
+        let mut data = (**self.level_info.load()).clone();
+        let time = self
+            .level_time
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        data.world_age = time.world_age;
+        data.day_time = time.time_of_day;
+        if let Some(name) = self.dimension.default_clock {
+            data.world_clocks.clocks.insert(
+                name.to_string(),
+                DimensionClock {
+                    total_ticks: time.time_of_day,
+                    partial_tick: time.partial_tick,
+                    rate: time.rate,
+                    paused: time.paused,
+                },
+            );
+        }
+        drop(time);
+        let weather = self
+            .weather
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        data.weather = WeatherData {
+            clear_weather_time: weather.clear_weather_time,
+            rain_time: weather.rain_time,
+            thunder_time: weather.thunder_time,
+            raining: weather.raining,
+            thundering: weather.thundering,
+            data_version: pumpkin_world::world_info::CURRENT_WORLD_DATA_VERSION,
+        };
+        data.clear_weather_time = data.weather.clear_weather_time;
+        drop(weather);
+        if let Some(server) = self.server.upgrade() {
+            for world in server.worlds.load().iter().filter(|world| {
+                world.level.level_folder.root_folder == self.level.level_folder.root_folder
+            }) {
+                if let Some(name) = world.dimension.default_clock {
+                    let time = world
+                        .level_time
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    data.world_clocks.clocks.insert(
+                        name.to_string(),
+                        DimensionClock {
+                            total_ticks: time.time_of_day,
+                            partial_tick: time.partial_tick,
+                            rate: time.rate,
+                            paused: time.paused,
+                        },
+                    );
+                }
+            }
+        }
+        let border = self
+            .worldborder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot();
+        data.border_center_x = border.center_x;
+        data.border_center_z = border.center_z;
+        data.border_damage_per_block = border.damage_per_block;
+        data.border_safe_zone = border.safe_zone;
+        data.border_warning_blocks = f64::from(border.warning_blocks);
+        data.border_warning_time = f64::from(border.warning_time) / 20.0;
+        data.border_size = border.size;
+        data.border_size_lerp_target = border.lerp_target;
+        data.border_size_lerp_time = border.lerp_time.saturating_mul(50);
+        data
+    }
+
     pub async fn save_with_mode(&self, mode: SaveMode) -> Result<u64, String> {
         let (sender, receiver) = oneshot::channel();
         self.save_state
@@ -185,12 +288,20 @@ impl World {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone(),
+            metadata: (self.dimension.minecraft_name
+                == pumpkin_data::dimension::Dimension::OVERWORLD.minecraft_name)
+                .then(|| self.snapshot_level_data()),
+            border: self
+                .worldborder
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .snapshot(),
             completions: Mutex::new(completions),
         })
     }
 
     /// Called after entity and block entity ticks have joined.
-    pub(super) fn process_save_requests(self: &Arc<Self>) {
+    pub(crate) fn process_save_requests(self: &Arc<Self>) {
         let requests = std::mem::take(
             &mut *self
                 .save_state
@@ -368,34 +479,8 @@ impl World {
         if let Err(error) = self.level.save_entity_chunks(entity_chunks).await {
             errors.push(error.to_string());
         }
-        if snapshot.generation >= self.save_state.committed.load(Ordering::Acquire) {
-            let mut poi = snapshot.poi.clone();
-            let folder = self.level.level_folder.root_folder.clone();
-            let custom = snapshot.custom_data.clone();
-            let synchronize = snapshot.mode.synchronize();
-            let data_result = tokio::task::spawn_blocking(move || {
-                poi.save_all()?;
-                if synchronize {
-                    poi.synchronize()?;
-                }
-                let path = folder.join("pumpkin_custom_data.nbt");
-                if !custom.is_empty() {
-                    pumpkin_world::world_info::atomic_write(
-                        &path,
-                        &pumpkin_nbt::Nbt::from(custom).write(),
-                    )?;
-                }
-                if synchronize && path.exists() {
-                    std::fs::File::open(path)?.sync_all()?;
-                }
-                Ok(())
-            })
-            .await
-            .map_err(|error| error.to_string())
-            .and_then(|result| result.map_err(|error: std::io::Error| error.to_string()));
-            if let Err(error) = data_result {
-                errors.push(error);
-            }
+        if let Err(error) = self.persist_world_data(snapshot).await {
+            errors.push(error);
         }
         if let Err(error) = self.level.flush_saves(snapshot.mode.synchronize()).await {
             errors.push(error.to_string());
@@ -413,6 +498,65 @@ impl World {
         } else {
             Err(errors.join("; "))
         }
+    }
+
+    async fn persist_world_data(&self, snapshot: &Snapshot) -> Result<(), String> {
+        if snapshot.generation >= self.save_state.committed.load(Ordering::Acquire) {
+            let mut poi = snapshot.poi.clone();
+            let folder = self.level.level_folder.root_folder.clone();
+            let custom = snapshot.custom_data.clone();
+            let metadata = snapshot.metadata.clone();
+            let metadata_committed = self.save_state.metadata_committed.clone();
+            let generation = snapshot.generation;
+            let server = self.server.upgrade();
+            let border = snapshot.border.clone();
+            let dimension_folder = self.level.level_folder.dim_folder.clone();
+            let synchronize = snapshot.mode.synchronize();
+            let data_result = tokio::task::spawn_blocking(move || {
+                poi.save_all()?;
+                if synchronize {
+                    poi.synchronize()?;
+                }
+                let path = folder.join("pumpkin_custom_data.nbt");
+                if !custom.is_empty() {
+                    pumpkin_world::world_info::atomic_write(
+                        &path,
+                        &pumpkin_nbt::Nbt::from(custom).write(),
+                    )?;
+                }
+                if synchronize && path.exists() {
+                    std::fs::File::open(path)?.sync_all()?;
+                    std::fs::File::open(&folder)?.sync_all()?;
+                }
+                write_world_border(&dimension_folder, &border, synchronize)
+                    .map_err(std::io::Error::other)?;
+                if let Some(metadata) = metadata
+                    && generation >= metadata_committed.load(Ordering::Acquire)
+                {
+                    if let Some(server) = server {
+                        server
+                            .world_info_writer
+                            .write_world_info(&metadata, &folder)
+                            .map_err(std::io::Error::other)?;
+                    } else {
+                        use pumpkin_world::world_info::WorldInfoWriter;
+                        pumpkin_world::world_info::anvil::AnvilLevelInfo
+                            .write_world_info(&metadata, &folder)
+                            .map_err(std::io::Error::other)?;
+                    }
+                    if synchronize {
+                        synchronize_world_info(&folder).map_err(std::io::Error::other)?;
+                    }
+                    metadata_committed.fetch_max(generation, Ordering::Release);
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result.map_err(|error: std::io::Error| error.to_string()));
+            data_result?;
+        }
+        Ok(())
     }
 
     async fn persist_pending(&self) -> Result<(), String> {
@@ -484,5 +628,121 @@ impl World {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(snapshot.generation, snapshot);
         self.persist_pending().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arc_swap::ArcSwap;
+    use pumpkin_data::dimension::Dimension;
+    use pumpkin_util::world_seed::Seed;
+    use pumpkin_world::{
+        level::Level,
+        world_info::{
+            WorldInfoReader,
+            anvil::AnvilLevelInfo,
+            data_files::{minecraft_data_dir, read_weather, read_world_clocks},
+        },
+    };
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn metadata_snapshot_survives_mutation_and_failed_save_retry() {
+        let folder = tempfile::tempdir().unwrap();
+        let level = Level::from_root_folder(
+            &pumpkin_config::world::LevelConfig::default(),
+            folder.path().to_path_buf(),
+            42,
+            Dimension::OVERWORLD,
+        );
+        let world = Arc::new(World::load(
+            level.clone(),
+            Arc::new(ArcSwap::from_pointee(LevelData::default(Seed(42)))),
+            Dimension::OVERWORLD,
+            crate::block::registry::default_registry(),
+            Weak::new(),
+        ));
+        {
+            let mut time = world.level_time.lock().unwrap();
+            time.world_age = 123456;
+            time.time_of_day = 9001;
+            time.partial_tick = 0.25;
+            time.rate = 0.5;
+            time.paused = true;
+        };
+        {
+            let mut weather = world.weather.lock().unwrap();
+            weather.rain_time = 1200;
+            weather.thunder_time = 1300;
+            weather.raining = true;
+        };
+        let snapshot = world.capture_save(SaveMode::Autosave, None, Vec::new());
+        world.level_time.lock().unwrap().set_time(18000);
+        world.weather.lock().unwrap().rain_time = 2400;
+        world.persist_world_data(&snapshot).await.unwrap();
+        let info = AnvilLevelInfo.read_world_info(folder.path()).unwrap();
+        assert_eq!(info.world_age, 123456);
+        assert_eq!(info.day_time, 9001);
+        let clocks = read_world_clocks(folder.path());
+        let clock = &clocks.clocks["minecraft:overworld"];
+        assert_eq!(clock.partial_tick, 0.25);
+        assert_eq!(clock.rate, 0.5);
+        assert!(clock.paused);
+        let weather = read_weather(folder.path());
+        assert_eq!(weather.rain_time, 1200);
+        assert_eq!(weather.thunder_time, 1300);
+        assert!(weather.raining);
+        let snapshot = world.capture_save(SaveMode::Flush, None, Vec::new());
+        world
+            .save_state
+            .pending
+            .lock()
+            .unwrap()
+            .insert(snapshot.generation, snapshot.clone());
+        let path = minecraft_data_dir(folder.path()).join("weather.dat");
+        let valid = std::fs::read(&path).unwrap();
+        std::fs::write(&path, b"unreadable imported weather").unwrap();
+        assert!(world.persist_pending().await.is_err());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"unreadable imported weather"
+        );
+        assert!(
+            world
+                .save_state
+                .pending
+                .lock()
+                .unwrap()
+                .contains_key(&snapshot.generation)
+        );
+        std::fs::write(&path, valid).unwrap();
+        world.persist_pending().await.unwrap();
+        assert!(world.save_state.pending.lock().unwrap().is_empty());
+        assert_eq!(
+            AnvilLevelInfo
+                .read_world_info(folder.path())
+                .unwrap()
+                .day_time,
+            18000
+        );
+        assert_eq!(read_weather(folder.path()).rain_time, 2400);
+        world.level_time.lock().unwrap().set_time(26000);
+        let newer = world.capture_save(SaveMode::Manual, None, Vec::new());
+        world
+            .save_state
+            .pending
+            .lock()
+            .unwrap()
+            .insert(newer.generation, newer);
+        world.persist_pending().await.unwrap();
+        world.persist_world_data(&snapshot).await.unwrap();
+        assert_eq!(
+            AnvilLevelInfo
+                .read_world_info(folder.path())
+                .unwrap()
+                .day_time,
+            26000
+        );
+        level.shutdown().await;
     }
 }

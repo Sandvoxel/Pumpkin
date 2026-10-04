@@ -9,7 +9,7 @@ use pumpkin_nbt::{compound::NbtCompound, nbt_compress::read_gzip_compound_tag, t
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::world_info::{WorldGenSettings, WorldInfoError};
+use crate::world_info::{CURRENT_WORLD_DATA_VERSION, WorldGenSettings, WorldInfoError};
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct DataFileRoot<T> {
@@ -74,12 +74,26 @@ impl WorldGenSettingsData {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct DimensionClock {
     pub total_ticks: i64,
+    pub partial_tick: f32,
+    pub rate: f32,
+    pub paused: bool,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+impl Default for DimensionClock {
+    fn default() -> Self {
+        Self {
+            total_ticks: 0,
+            partial_tick: 0.0,
+            rate: 1.0,
+            paused: false,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Debug, Default)]
 pub struct WorldClocksData {
     pub clocks: std::collections::HashMap<String, DimensionClock>,
     pub data_version: i32,
@@ -144,6 +158,232 @@ pub fn ensure_minecraft_data_dir(level_folder: &Path) -> Result<PathBuf, WorldIn
     Ok(dir)
 }
 
+pub(super) fn overlay_compound(stored: &mut NbtCompound, fresh: NbtCompound) {
+    for (key, tag) in fresh.child_tags {
+        match (stored.child_tags.get_mut(&key), tag) {
+            (Some(NbtTag::Compound(stored)), NbtTag::Compound(fresh)) => {
+                overlay_compound(stored, fresh);
+            }
+            (_, tag) => {
+                stored.child_tags.insert(key, tag);
+            }
+        }
+    }
+}
+
+fn read_saved_data(path: &Path) -> Result<NbtCompound, WorldInfoError> {
+    let mut root = read_gzip_compound_tag(File::open(path)?).map_err(|error| {
+        WorldInfoError::DeserializationError(format!("{}: {error}", path.display()))
+    })?;
+    if path
+        .file_name()
+        .is_some_and(|name| name == "world_gen_settings.dat")
+    {
+        let payload = world_gen_settings_payload(&root).cloned().ok_or_else(|| {
+            WorldInfoError::DeserializationError(format!("{}: missing seed", path.display()))
+        })?;
+        let mut data = root.get_compound("data").cloned().unwrap_or_default();
+        overlay_compound(&mut data, payload);
+        root.put_compound("data", data);
+    } else if root.get_compound("data").is_none() {
+        if path.file_name().is_some_and(|name| name == "weather.dat")
+            && root.get_int("rain_time").is_some()
+        {
+            root.put_compound("data", root.clone());
+        } else {
+            return Err(WorldInfoError::DeserializationError(format!(
+                "{}: missing data compound",
+                path.display()
+            )));
+        }
+    }
+    validate_saved_data(&root, path)?;
+    Ok(root)
+}
+
+fn validate_saved_data(root: &NbtCompound, path: &Path) -> Result<(), WorldInfoError> {
+    let data = root
+        .get_compound("data")
+        .ok_or_else(|| WorldInfoError::DeserializationError("Missing data".into()))?;
+    let invalid =
+        || WorldInfoError::DeserializationError(format!("{}: invalid saved data", path.display()));
+    match path.file_name().and_then(|name| name.to_str()) {
+        Some("weather.dat") => {
+            for name in ["clear_weather_time", "rain_time", "thunder_time"] {
+                data.get_int(name).ok_or_else(invalid)?;
+            }
+            for name in ["raining", "thundering"] {
+                data.get_bool(name).ok_or_else(invalid)?;
+            }
+        }
+        Some("game_rules.dat") => {
+            let defaults = GameRuleRegistry::default();
+            for rule in GameRule::all() {
+                let name = format!("minecraft:{rule}");
+                if data.child_tags.contains_key(name.as_str()) {
+                    match defaults.get(rule) {
+                        GameRuleValue::Bool(_) => {
+                            data.get_bool(&name).ok_or_else(invalid)?;
+                        }
+                        GameRuleValue::Int(_) => {
+                            data.get_int(&name).ok_or_else(invalid)?;
+                        }
+                    }
+                }
+            }
+        }
+        Some("world_gen_settings.dat") => {
+            data.get_long("seed").ok_or_else(invalid)?;
+        }
+        Some("world_clocks.dat") => {
+            for (name, tag) in &data.child_tags {
+                if name.as_ref() == "DataVersion" {
+                    continue;
+                }
+                let NbtTag::Compound(clock) = tag else {
+                    return Err(invalid());
+                };
+                clock.get_long("total_ticks").ok_or_else(invalid)?;
+                for name in ["partial_tick", "rate"] {
+                    if clock.child_tags.contains_key(name) {
+                        let value = clock.get_float(name).ok_or_else(invalid)?;
+                        if !value.is_finite() || (name == "rate" && value <= 0.0) {
+                            return Err(invalid());
+                        }
+                    }
+                }
+                if clock.child_tags.contains_key("paused") {
+                    clock.get_bool("paused").ok_or_else(invalid)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn write_saved_data(
+    level_folder: &Path,
+    name: &str,
+    fresh: NbtCompound,
+    overworld_fallback: bool,
+) -> Result<(), WorldInfoError> {
+    let path = minecraft_data_dir(level_folder).join(name);
+    let source = if overworld_fallback {
+        find_overworld_data_file(level_folder, name)
+    } else if path.try_exists()? {
+        Some(path.clone())
+    } else {
+        None
+    };
+    let mut root = source
+        .as_deref()
+        .map(read_saved_data)
+        .transpose()?
+        .unwrap_or_default();
+    overlay_compound(&mut root, fresh);
+    root.put_int("DataVersion", CURRENT_WORLD_DATA_VERSION);
+    if let Some(NbtTag::Compound(data)) = root.child_tags.get_mut("data") {
+        data.child_tags.remove("DataVersion");
+    }
+    let bytes = pumpkin_nbt::nbt_compress::write_gzip_compound_tag_to_bytes(root)
+        .map_err(|error| WorldInfoError::SerializationError(error.to_string()))?;
+    fs::create_dir_all(minecraft_data_dir(level_folder))?;
+    super::atomic_write(&path, &bytes)?;
+    Ok(())
+}
+
+pub fn synchronize_world_info(level_folder: &Path) -> Result<(), WorldInfoError> {
+    for name in [
+        "level.dat",
+        "level.dat_old",
+        "data/minecraft/game_rules.dat",
+        "data/minecraft/world_gen_settings.dat",
+        "data/minecraft/world_clocks.dat",
+        "data/minecraft/weather.dat",
+    ] {
+        let path = level_folder.join(name);
+        match File::open(path) {
+            Ok(file) => file.sync_all()?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    File::open(minecraft_data_dir(level_folder))?.sync_all()?;
+    File::open(level_folder.join("data"))?.sync_all()?;
+    File::open(level_folder)?.sync_all()?;
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorldBorderData {
+    pub center_x: f64,
+    pub center_z: f64,
+    pub damage_per_block: f64,
+    pub safe_zone: f64,
+    pub warning_blocks: i32,
+    pub warning_time: i32,
+    pub size: f64,
+    pub lerp_time: i64,
+    pub lerp_target: f64,
+}
+
+pub fn read_world_border(
+    dimension_folder: &Path,
+) -> Result<Option<WorldBorderData>, WorldInfoError> {
+    let path = minecraft_data_dir(dimension_folder).join("world_border.dat");
+    if !path.try_exists()? {
+        return Ok(None);
+    }
+    let root = read_saved_data(&path)?;
+    let data = root
+        .get_compound("data")
+        .ok_or_else(|| WorldInfoError::DeserializationError("Missing border data".into()))?;
+    let missing = || {
+        WorldInfoError::DeserializationError(format!("{}: invalid border settings", path.display()))
+    };
+    Ok(Some(WorldBorderData {
+        center_x: data.get_double("center_x").ok_or_else(missing)?,
+        center_z: data.get_double("center_z").ok_or_else(missing)?,
+        damage_per_block: data.get_double("damage_per_block").ok_or_else(missing)?,
+        safe_zone: data.get_double("safe_zone").ok_or_else(missing)?,
+        warning_blocks: data.get_int("warning_blocks").ok_or_else(missing)?,
+        warning_time: data.get_int("warning_time").ok_or_else(missing)?,
+        size: data.get_double("size").ok_or_else(missing)?,
+        lerp_time: data.get_long("lerp_time").ok_or_else(missing)?,
+        lerp_target: data.get_double("lerp_target").ok_or_else(missing)?,
+    }))
+}
+
+pub fn write_world_border(
+    dimension_folder: &Path,
+    border: &WorldBorderData,
+    synchronize: bool,
+) -> Result<(), WorldInfoError> {
+    // Validate the existing codec before replacing any of its owned fields.
+    read_world_border(dimension_folder)?;
+    let mut data = NbtCompound::new();
+    data.put_double("center_x", border.center_x);
+    data.put_double("center_z", border.center_z);
+    data.put_double("damage_per_block", border.damage_per_block);
+    data.put_double("safe_zone", border.safe_zone);
+    data.put_int("warning_blocks", border.warning_blocks);
+    data.put_int("warning_time", border.warning_time);
+    data.put_double("size", border.size);
+    data.put_long("lerp_time", border.lerp_time);
+    data.put_double("lerp_target", border.lerp_target);
+    let mut root = NbtCompound::new();
+    root.put_compound("data", data);
+    write_saved_data(dimension_folder, "world_border.dat", root, false)?;
+    if synchronize {
+        File::open(minecraft_data_dir(dimension_folder).join("world_border.dat"))?.sync_all()?;
+        File::open(minecraft_data_dir(dimension_folder))?.sync_all()?;
+        File::open(dimension_folder.join("data"))?.sync_all()?;
+        File::open(dimension_folder)?.sync_all()?;
+    }
+    Ok(())
+}
+
 /// Reads weather from the root data directory, falling back to Paper's overworld directory.
 ///
 /// Returns defaults if neither file exists or the selected file cannot be opened or decoded.
@@ -152,36 +392,30 @@ pub fn read_weather(level_folder: &Path) -> WeatherData {
     let Some(path) = find_overworld_data_file(level_folder, "weather.dat") else {
         return WeatherData::default();
     };
-    match File::open(&path) {
-        Ok(f) => match read_gzip_compound_tag(f) {
-            Ok(compound) => {
-                let data_compound = compound.get_compound("data");
-                let c = data_compound.as_ref().map_or(&compound, |v| v);
-                WeatherData {
-                    clear_weather_time: c.get_int("clear_weather_time").unwrap_or(0),
-                    rain_time: c.get_int("rain_time").unwrap_or(0),
-                    thunder_time: c.get_int("thunder_time").unwrap_or(0),
-                    raining: c.get_bool("raining").unwrap_or(false),
-                    thundering: c.get_bool("thundering").unwrap_or(false),
-                    data_version: c.get_int("DataVersion").unwrap_or(0),
-                }
+    match read_saved_data(&path) {
+        Ok(compound) => {
+            let data_compound = compound.get_compound("data");
+            let c = data_compound.as_ref().map_or(&compound, |v| v);
+            WeatherData {
+                clear_weather_time: c.get_int("clear_weather_time").unwrap_or(0),
+                rain_time: c.get_int("rain_time").unwrap_or(0),
+                thunder_time: c.get_int("thunder_time").unwrap_or(0),
+                raining: c.get_bool("raining").unwrap_or(false),
+                thundering: c.get_bool("thundering").unwrap_or(false),
+                data_version: compound
+                    .get_int("DataVersion")
+                    .or_else(|| c.get_int("DataVersion"))
+                    .unwrap_or(0),
             }
-            Err(e) => {
-                warn!("Failed to deserialize weather.dat, using defaults: {e}");
-                WeatherData::default()
-            }
-        },
-        Err(e) => {
-            warn!("Failed to open weather.dat, using defaults: {e}");
+        }
+        Err(error) => {
+            warn!("Failed loading weather.dat: {error}");
             WeatherData::default()
         }
     }
 }
 
 pub fn write_weather(level_folder: &Path, data: &WeatherData) -> Result<(), WorldInfoError> {
-    let dir = ensure_minecraft_data_dir(level_folder)?;
-    let path = dir.join("weather.dat");
-    let file = File::create(&path)?;
     let mut data_comp = NbtCompound::new();
     data_comp.put_int("clear_weather_time", data.clear_weather_time);
     data_comp.put_int("rain_time", data.rain_time);
@@ -191,8 +425,7 @@ pub fn write_weather(level_folder: &Path, data: &WeatherData) -> Result<(), Worl
     let mut root = NbtCompound::new();
     root.put_int("DataVersion", data.data_version);
     root.put_compound("data", data_comp);
-    pumpkin_nbt::nbt_compress::write_gzip_compound_tag(root, BufWriter::new(file))
-        .map_err(|e| WorldInfoError::SerializationError(e.to_string()))
+    write_saved_data(level_folder, "weather.dat", root, true)
 }
 
 #[must_use]
@@ -258,24 +491,9 @@ pub fn nbt_tag_to_json(tag: &NbtTag) -> serde_json::Value {
 #[must_use]
 pub fn read_world_gen_settings(level_folder: &Path) -> Option<WorldGenSettings> {
     // Support world generation settings locations used by vanilla and Paper-derived 26.x worlds.
-    let paths = [
-        minecraft_data_dir(level_folder).join("world_gen_settings.dat"),
-        level_folder
-            .join("dimensions")
-            .join("minecraft")
-            .join("overworld")
-            .join("data")
-            .join("minecraft")
-            .join("world_gen_settings.dat"),
-    ];
-
-    for path in paths.iter().filter(|path| path.exists()) {
-        if let Some(settings) = read_world_gen_settings_file(path) {
-            return Some(settings);
-        }
-    }
-
-    None
+    find_overworld_data_file(level_folder, "world_gen_settings.dat")
+        .as_deref()
+        .and_then(read_world_gen_settings_file)
 }
 
 fn read_world_gen_settings_file(path: &Path) -> Option<WorldGenSettings> {
@@ -377,14 +595,12 @@ pub fn write_world_gen_settings(
     settings: &WorldGenSettings,
     data_version: i32,
 ) -> Result<(), WorldInfoError> {
-    let dir = ensure_minecraft_data_dir(level_folder)?;
-    let path = dir.join("world_gen_settings.dat");
-    let file = File::create(&path)?;
     let mut inner = NbtCompound::new();
-    inner.put_int("DataVersion", data_version);
     inner.put_long("seed", settings.seed);
-    inner.put_bool("generate_structures", true);
-    inner.put_bool("bonus_chest", false);
+    if find_overworld_data_file(level_folder, "world_gen_settings.dat").is_none() {
+        inner.put_bool("generate_structures", true);
+        inner.put_bool("bonus_chest", false);
+    }
 
     let mut dims_comp = NbtCompound::new();
     for (dim_name, dim) in &settings.dimensions {
@@ -427,8 +643,8 @@ pub fn write_world_gen_settings(
 
     let mut root = NbtCompound::new();
     root.put_compound("data", inner);
-    pumpkin_nbt::nbt_compress::write_gzip_compound_tag(root, BufWriter::new(file))
-        .map_err(|e| WorldInfoError::SerializationError(e.to_string()))
+    root.put_int("DataVersion", data_version);
+    write_saved_data(level_folder, "world_gen_settings.dat", root, true)
 }
 
 #[must_use]
@@ -441,10 +657,9 @@ pub fn game_rules_to_nbt(rules: &GameRuleRegistry, data_version: i32) -> NbtComp
             GameRuleValue::Int(i) => inner.put(&key, NbtTag::Int(*i as i32)),
         }
     }
-    inner.put_int("DataVersion", data_version);
-
     let mut root = NbtCompound::new();
     root.put_compound("data", inner);
+    root.put_int("DataVersion", data_version);
     root
 }
 
@@ -504,32 +719,19 @@ pub fn write_game_rules(
     rules: &GameRuleRegistry,
     data_version: i32,
 ) -> Result<(), WorldInfoError> {
-    let dir = ensure_minecraft_data_dir(level_folder)?;
-    let path = dir.join("game_rules.dat");
-
     let compound = game_rules_to_nbt(rules, data_version);
-    let file = File::create(&path)?;
-
-    pumpkin_nbt::nbt_compress::write_gzip_compound_tag(compound, file)
-        .map_err(|e| WorldInfoError::SerializationError(e.to_string()))
+    write_saved_data(level_folder, "game_rules.dat", compound, true)
 }
 
 pub fn read_world_clocks(level_folder: &Path) -> WorldClocksData {
-    let path = minecraft_data_dir(level_folder).join("world_clocks.dat");
-    if !path.exists() {
+    let Some(path) = find_overworld_data_file(level_folder, "world_clocks.dat") else {
         return WorldClocksData::default();
-    }
+    };
 
-    match File::open(&path) {
-        Ok(f) => match read_gzip_compound_tag(f) {
-            Ok(compound) => world_clocks_from_nbt(&compound),
-            Err(e) => {
-                warn!("Failed to parse world_clocks.dat: {e}");
-                WorldClocksData::default()
-            }
-        },
-        Err(e) => {
-            warn!("Failed to open world_clocks.dat: {e}");
+    match read_saved_data(&path) {
+        Ok(compound) => world_clocks_from_nbt(&compound),
+        Err(error) => {
+            warn!("Failed loading world_clocks.dat: {error}");
             WorldClocksData::default()
         }
     }
@@ -542,7 +744,10 @@ fn world_clocks_from_nbt(root: &NbtCompound) -> WorldClocksData {
         return result;
     };
 
-    result.data_version = inner.get_int("DataVersion").unwrap_or(0);
+    result.data_version = root
+        .get_int("DataVersion")
+        .or_else(|| inner.get_int("DataVersion"))
+        .unwrap_or(0);
 
     for (key, tag) in &inner.child_tags {
         if key.as_ref() == "DataVersion" {
@@ -550,9 +755,15 @@ fn world_clocks_from_nbt(root: &NbtCompound) -> WorldClocksData {
         }
         if let NbtTag::Compound(dim_compound) = tag {
             let total_ticks = dim_compound.get_long("total_ticks").unwrap_or(0);
-            result
-                .clocks
-                .insert(key.to_string(), DimensionClock { total_ticks });
+            result.clocks.insert(
+                key.to_string(),
+                DimensionClock {
+                    total_ticks,
+                    partial_tick: dim_compound.get_float("partial_tick").unwrap_or(0.0),
+                    rate: dim_compound.get_float("rate").unwrap_or(1.0),
+                    paused: dim_compound.get_bool("paused").unwrap_or(false),
+                },
+            );
         }
     }
 
@@ -563,24 +774,19 @@ pub fn write_world_clocks(
     level_folder: &Path,
     clocks: &WorldClocksData,
 ) -> Result<(), WorldInfoError> {
-    let dir = ensure_minecraft_data_dir(level_folder)?;
-    let path = dir.join("world_clocks.dat");
-
     let mut inner = NbtCompound::new();
     for (dim_name, clock) in &clocks.clocks {
         let mut dim_compound = NbtCompound::new();
         dim_compound.put_long("total_ticks", clock.total_ticks);
+        dim_compound.put_float("partial_tick", clock.partial_tick);
+        dim_compound.put_float("rate", clock.rate);
+        dim_compound.put_bool("paused", clock.paused);
         inner.put_compound(dim_name, dim_compound);
     }
-    inner.put_int("DataVersion", clocks.data_version);
-
     let mut root = NbtCompound::new();
     root.put_compound("data", inner);
-
-    let file = File::create(&path)?;
-
-    pumpkin_nbt::nbt_compress::write_gzip_compound_tag(root, file)
-        .map_err(|e| WorldInfoError::SerializationError(e.to_string()))
+    root.put_int("DataVersion", clocks.data_version);
+    write_saved_data(level_folder, "world_clocks.dat", root, true)
 }
 
 /// Reads trader spawn settings, preferring root data over Paper's overworld copy.
@@ -746,4 +952,124 @@ pub fn write_stopwatches_stub(
     let file = File::create(&path)?;
     pumpkin_nbt::nbt_compress::write_gzip_compound_tag(root, file)
         .map_err(|e| WorldInfoError::SerializationError(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pumpkin_nbt::nbt_compress::write_gzip_compound_tag;
+
+    fn fixture(folder: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        let path = minecraft_data_dir(folder).join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn vanilla_clocks_weather_and_border_preserve_unknown_fields() {
+        let folder = tempfile::tempdir().unwrap();
+        let clocks_path = fixture(
+            folder.path(),
+            "world_clocks.dat",
+            include_bytes!("../../../../assets/tests/storage_26_3/world_clocks.dat"),
+        );
+        let weather_path = fixture(
+            folder.path(),
+            "weather.dat",
+            include_bytes!("../../../../assets/tests/storage_26_3/weather.dat"),
+        );
+        let border_path = fixture(
+            folder.path(),
+            "world_border.dat",
+            include_bytes!("../../../../assets/tests/storage_26_3/world_border.dat"),
+        );
+        let mut clocks = read_world_clocks(folder.path());
+        assert_eq!(clocks.clocks["minecraft:overworld"].total_ticks, 2447);
+        assert!(clocks.clocks["minecraft:overworld"].paused);
+        assert_eq!(clocks.clocks["minecraft:the_end"].total_ticks, 275516);
+        let mut weather = read_weather(folder.path());
+        assert_eq!(weather.clear_weather_time, 759895);
+        assert_eq!(weather.rain_time, 1);
+        let mut border = read_world_border(folder.path()).unwrap().unwrap();
+        assert_eq!(border.warning_time, 300);
+        assert_eq!(border.size, 59_999_968.0);
+        for path in [&clocks_path, &weather_path, &border_path] {
+            let mut root = read_saved_data(path).unwrap();
+            root.put_string("unknown_root", "kept".to_string());
+            let mut data = root.get_compound("data").unwrap().clone();
+            if path == &clocks_path {
+                let mut clock = data.get_compound("minecraft:overworld").unwrap().clone();
+                clock.put_int("unknown_clock", 42);
+                data.put_compound("minecraft:overworld", clock);
+            } else {
+                data.put_int("unknown_field", 42);
+            }
+            root.put_compound("data", data);
+            write_gzip_compound_tag(root, File::create(path).unwrap()).unwrap();
+        }
+        let clock = clocks.clocks.get_mut("minecraft:overworld").unwrap();
+        clock.total_ticks = 90001;
+        clock.partial_tick = 0.25;
+        clock.rate = 0.5;
+        clock.paused = false;
+        weather.raining = true;
+        weather.rain_time = 1234;
+        border.center_x = -42.25;
+        border.size = 100.0;
+        border.lerp_time = 80;
+        border.lerp_target = 500.0;
+        write_world_clocks(folder.path(), &clocks).unwrap();
+        write_weather(folder.path(), &weather).unwrap();
+        write_world_border(folder.path(), &border, true).unwrap();
+        assert_eq!(read_world_clocks(folder.path()), clocks);
+        assert_eq!(read_weather(folder.path()), weather);
+        assert_eq!(read_world_border(folder.path()).unwrap().unwrap(), border);
+        for path in [&clocks_path, &weather_path, &border_path] {
+            let root = read_saved_data(path).unwrap();
+            assert_eq!(root.get_int("DataVersion"), Some(5023));
+            assert_eq!(root.get_string("unknown_root"), Some("kept"));
+            let data = root.get_compound("data").unwrap();
+            assert!(!data.child_tags.contains_key("DataVersion"));
+            if path == &clocks_path {
+                assert_eq!(
+                    data.get_compound("minecraft:overworld")
+                        .unwrap()
+                        .get_int("unknown_clock"),
+                    Some(42)
+                );
+            } else {
+                assert_eq!(data.get_int("unknown_field"), Some(42));
+            }
+        }
+    }
+
+    #[test]
+    fn unreadable_saved_data_is_preserved_and_can_be_retried() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = fixture(folder.path(), "weather.dat", b"corrupt imported weather");
+        let original = fs::read(&path).unwrap();
+        assert!(write_weather(folder.path(), &WeatherData::default()).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        let mut root = NbtCompound::new();
+        let mut data = NbtCompound::new();
+        data.put_string("rain_time", "invalid".to_string());
+        root.put_compound("data", data);
+        write_gzip_compound_tag(root, File::create(&path).unwrap()).unwrap();
+        let original = fs::read(&path).unwrap();
+        assert!(write_weather(folder.path(), &WeatherData::default()).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        fs::write(
+            &path,
+            include_bytes!("../../../../assets/tests/storage_26_3/weather.dat"),
+        )
+        .unwrap();
+        let weather = WeatherData {
+            rain_time: 5432,
+            data_version: 5023,
+            ..Default::default()
+        };
+        write_weather(folder.path(), &weather).unwrap();
+        assert_eq!(read_weather(folder.path()), weather);
+    }
 }

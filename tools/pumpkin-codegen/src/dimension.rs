@@ -42,6 +42,8 @@ pub struct Dimension {
     /// Fixed day-time value in this dimension, or `None` if time progresses normally.
     #[serde(rename = "fixed_time")]
     pub fixed_time: Option<i64>,
+    #[serde(default)]
+    pub default_clock: Option<String>,
     /// Whether time is fixed in this dimension (modern 26.2 field).
     #[serde(default, rename = "has_fixed_time")]
     pub has_fixed_time: Option<bool>,
@@ -199,6 +201,10 @@ pub fn build() -> TokenStream {
             quote! { None }
         };
         let has_fixed_time = dim.has_fixed_time.unwrap_or(dim.fixed_time.is_some());
+        let default_clock = match dim.default_clock {
+            Some(clock) => quote! { Some(#clock) },
+            None => quote! { None },
+        };
 
         let monster_spawn_light_level = value_to_int_provider(&dim.monster_spawn_light_level);
         let monster_spawn_block_light_limit = dim.monster_spawn_block_light_limit;
@@ -291,6 +297,7 @@ pub fn build() -> TokenStream {
                 id: #id,
                 minecraft_name: #minecraft_name,
                 fixed_time: #fixed_time,
+                default_clock: #default_clock,
                 has_fixed_time: #has_fixed_time,
                 has_skylight: #has_skylight,
                 has_ceiling: #has_ceiling,
@@ -381,6 +388,7 @@ pub fn build() -> TokenStream {
             pub id: u8,
             pub minecraft_name: &'static str,
             pub fixed_time: Option<i64>,
+            pub default_clock: Option<&'static str>,
             pub has_fixed_time: bool,
             pub has_skylight: bool,
             pub has_ceiling: bool,

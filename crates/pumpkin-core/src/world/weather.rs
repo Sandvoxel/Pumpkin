@@ -36,6 +36,20 @@ impl Default for Weather {
 }
 
 impl Weather {
+    pub fn from_saved(data: &pumpkin_world::world_info::data_files::WeatherData) -> Self {
+        Self {
+            clear_weather_time: data.clear_weather_time,
+            raining: data.raining,
+            rain_time: data.rain_time,
+            thundering: data.thundering,
+            thunder_time: data.thunder_time,
+            rain_level: f32::from(u8::from(data.raining)),
+            old_rain_level: f32::from(u8::from(data.raining)),
+            thunder_level: f32::from(u8::from(data.thundering)),
+            old_thunder_level: f32::from(u8::from(data.thundering)),
+            ..Self::new()
+        }
+    }
     #[must_use]
     pub const fn new() -> Self {
         Self {

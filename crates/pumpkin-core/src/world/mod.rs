@@ -409,6 +409,42 @@ impl World {
             NbtCompound::new()
         };
 
+        let info = level_info.load();
+        let mut level_time = LevelTime::new();
+        level_time.load_from(info.day_time, info.world_age);
+        if let Some(clock) = dimension
+            .default_clock
+            .and_then(|name| info.world_clocks.clocks.get(name))
+        {
+            level_time.time_of_day = clock.total_ticks;
+            level_time.partial_tick = clock.partial_tick;
+            level_time.rate = clock.rate;
+            level_time.paused = clock.paused;
+        }
+        let weather = Weather::from_saved(&info.weather);
+        let border = match pumpkin_world::world_info::data_files::read_world_border(
+            &level.level_folder.dim_folder,
+        ) {
+            Ok(Some(border)) => border,
+            result => {
+                if let Err(error) = result {
+                    error!("Failed loading world border: {error}");
+                }
+                pumpkin_world::world_info::data_files::WorldBorderData {
+                    center_x: info.border_center_x,
+                    center_z: info.border_center_z,
+                    damage_per_block: info.border_damage_per_block,
+                    safe_zone: info.border_safe_zone,
+                    warning_blocks: info.border_warning_blocks as i32,
+                    warning_time: (info.border_warning_time * 20.0) as i32,
+                    size: info.border_size,
+                    lerp_time: info.border_size_lerp_time / 50,
+                    lerp_target: info.border_size_lerp_target,
+                }
+            }
+        };
+        drop(info);
+
         Self {
             uuid: Uuid::new_v4(),
             level,
@@ -416,17 +452,10 @@ impl World {
             players: ArcSwap::new(Arc::new(Vec::new())),
             entities: ArcSwap::new(Arc::new(Vec::new())),
             scoreboard: std::sync::Mutex::new(Scoreboard::default()),
-            worldborder: std::sync::Mutex::new(Worldborder::new(
-                0.0,
-                0.0,
-                5.999_996_8E7,
-                0,
-                5,
-                300,
-            )),
-            level_time: std::sync::Mutex::new(LevelTime::new()),
+            worldborder: std::sync::Mutex::new(Worldborder::from_saved(&border)),
+            level_time: std::sync::Mutex::new(level_time),
             dimension,
-            weather: std::sync::Mutex::new(Weather::new()),
+            weather: std::sync::Mutex::new(weather),
             block_registry,
             sea_level: generation_settings.sea_level,
             min_y: i32::from(generation_settings.shape.min_y),
@@ -1631,8 +1660,6 @@ impl World {
             dragon_fight::DragonFight::tick(fight_mutex, self);
         }
 
-        self.process_save_requests();
-
         let total_elapsed = start.elapsed();
         if total_elapsed.as_millis() > 50 {
             debug!(
@@ -1827,6 +1854,10 @@ impl World {
     }
 
     pub fn tick_environment(self: &Arc<Self>) {
+        self.worldborder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .tick();
         let (is_night, time_of_day) = {
             let mut level_time = self
                 .level_time

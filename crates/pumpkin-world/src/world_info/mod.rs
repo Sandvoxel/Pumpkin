@@ -13,7 +13,8 @@ pub mod data_files;
 
 // Constraint: disk biome palette serialization changed in 1.21.5
 pub const MINIMUM_SUPPORTED_WORLD_DATA_VERSION: i32 = 4435; // 1.21.9
-pub const MAXIMUM_SUPPORTED_WORLD_DATA_VERSION: i32 = 4903; // 26.2
+pub const CURRENT_WORLD_DATA_VERSION: i32 = 5023; // Official 26.3 version.json
+pub const MAXIMUM_SUPPORTED_WORLD_DATA_VERSION: i32 = CURRENT_WORLD_DATA_VERSION;
 
 pub const MINIMUM_SUPPORTED_LEVEL_VERSION: i32 = 19132; // 1.21.9
 pub const MAXIMUM_SUPPORTED_LEVEL_VERSION: i32 = 19133; // 1.21.9
@@ -71,6 +72,8 @@ pub struct LevelData {
     pub spawn_yaw: f32,
     #[serde(default)]
     pub spawn_pitch: f32,
+    #[serde(skip, default = "default_spawn_dimension")]
+    pub spawn_dimension: String,
     #[serde(rename = "Version", default)]
     pub world_version: WorldVersion,
     #[serde(rename = "version", default = "default_level_version")]
@@ -97,10 +100,16 @@ pub struct LevelData {
     /// Persisted to `data/minecraft/weather.dat`.
     #[serde(rename = "clearWeatherTime", skip_serializing, default)]
     pub clear_weather_time: i32,
+    #[serde(rename = "Time", default)]
+    pub world_age: i64,
+    #[serde(skip)]
+    pub weather: data_files::WeatherData,
+    #[serde(skip)]
+    pub world_clocks: data_files::WorldClocksData,
 }
 
 const DEFAULT_BORDER_DAMAGE_PER_BLOCK: f64 = 0.2;
-const DEFAULT_BORDER_SIZE: f64 = 60_000_000.0;
+const DEFAULT_BORDER_SIZE: f64 = 59_999_968.0;
 const DEFAULT_BORDER_SAFE_ZONE: f64 = 5.0;
 const DEFAULT_BORDER_WARNING_BLOCKS: f64 = 5.0;
 const DEFAULT_BORDER_WARNING_TIME: f64 = 15.0;
@@ -139,6 +148,9 @@ const fn default_difficulty() -> Difficulty {
 }
 fn default_level_name() -> String {
     DEFAULT_LEVEL_NAME.to_string()
+}
+fn default_spawn_dimension() -> String {
+    pumpkin_data::dimension::Dimension::OVERWORLD.minecraft_name.to_string()
 }
 const fn default_spawn_y() -> i32 {
     DEFAULT_SPAWN_Y
@@ -548,6 +560,7 @@ impl LevelData {
             spawn_z: 0,
             spawn_yaw: 0.0,
             spawn_pitch: 0.0,
+            spawn_dimension: default_spawn_dimension(),
             world_version: WorldVersion::default(),
             level_version: MAXIMUM_SUPPORTED_LEVEL_VERSION,
             map_id: 0,
@@ -556,6 +569,9 @@ impl LevelData {
             world_gen_settings: WorldGenSettings::new(seed),
             day_time: 0,
             clear_weather_time: -1,
+            world_age: 0,
+            weather: data_files::WeatherData::default(),
+            world_clocks: data_files::WorldClocksData::default(),
         }
     }
 

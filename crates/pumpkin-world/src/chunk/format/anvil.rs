@@ -24,7 +24,7 @@ pub const REGION_SIZE: usize = 32;
 pub const SUBREGION_BITS: u8 = pumpkin_util::math::ceil_log2(REGION_SIZE as u32);
 pub const SUBREGION_AND: i32 = (1 << SUBREGION_BITS) - 1;
 pub const CHUNK_COUNT: usize = REGION_SIZE * REGION_SIZE;
-pub const WORLD_DATA_VERSION: i32 = 4903;
+pub const WORLD_DATA_VERSION: i32 = crate::world_info::CURRENT_WORLD_DATA_VERSION;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

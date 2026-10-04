@@ -150,7 +150,7 @@ pub struct Server {
 
     // world stuff which maybe should be put into a struct
     pub level_info: Arc<ArcSwap<LevelData>>,
-    world_info_writer: Arc<dyn WorldInfoWriter>,
+    pub(crate) world_info_writer: Arc<dyn WorldInfoWriter>,
 }
 
 impl Server {
@@ -521,6 +521,9 @@ impl Server {
     }
 
     pub fn save_world_info(&self) -> Result<(), WorldInfoError> {
+        if let Some(world) = self.worlds.load().first() {
+            return world.write_metadata_now(self.world_info_writer.as_ref());
+        }
         let level_data = self.level_info.load();
         self.world_info_writer
             .write_world_info(&level_data, &self.basic_config.get_world_path())
@@ -580,11 +583,6 @@ impl Server {
         &self,
         mode: crate::world::saving::SaveMode,
     ) -> Result<(), String> {
-        if let Err(err) = self.save_world_info() {
-            error!("Failed to save world info: {err}");
-            return Err(format!("Failed to save world info: {err}"));
-        }
-
         if let Err(err) = self.player_data_storage.save_all_players(self) {
             error!("Failed to save player data: {err}");
             return Err(format!("Failed to save player data: {err}"));
@@ -755,15 +753,6 @@ impl Server {
         info!("Starting worlds");
         for world in self.worlds.load().iter() {
             world.shutdown().await;
-        }
-        let level_data = self.level_info.load();
-        // then lets save the world info
-
-        if let Err(err) = self
-            .world_info_writer
-            .write_world_info(&level_data, &self.basic_config.get_world_path())
-        {
-            error!("Failed to save level.dat: {err}");
         }
         info!("Completed worlds");
     }
@@ -1133,6 +1122,9 @@ impl Server {
             self.sync_game_time();
             self.tick_players_and_network();
         }
+        for world in self.worlds.load().iter() {
+            world.process_save_requests();
+        }
         self.flush_pending_block_updates();
         Self::resume_player_flushes(&suspended);
     }
@@ -1185,7 +1177,6 @@ impl Server {
             let _guard = handle.enter();
             world.tick(self);
         });
-
         // Global tasks
         self.player_data_storage.tick(self);
     }

@@ -4,6 +4,7 @@ use pumpkin_protocol::java::client::play::{
 };
 
 use crate::net::java::JavaClient;
+use pumpkin_world::world_info::data_files::WorldBorderData;
 
 use super::World;
 
@@ -16,8 +17,10 @@ pub struct Worldborder {
     pub portal_teleport_boundary: i32,
     pub warning_blocks: i32,
     pub warning_time: i32,
-    pub damage_per_block: f32,
-    pub buffer: f32,
+    pub damage_per_block: f64,
+    pub buffer: f64,
+    lerp_from: f64,
+    lerp_duration: i64,
 }
 
 impl Worldborder {
@@ -41,6 +44,49 @@ impl Worldborder {
             warning_time,
             damage_per_block: 0.0,
             buffer: 0.0,
+            lerp_from: diameter,
+            lerp_duration: speed,
+        }
+    }
+
+    pub const fn from_saved(data: &WorldBorderData) -> Self {
+        let mut border = Self::new(
+            data.center_x,
+            data.center_z,
+            data.size,
+            data.lerp_time,
+            data.warning_blocks,
+            data.warning_time,
+        );
+        border.new_diameter = if data.lerp_time > 0 {
+            data.lerp_target
+        } else {
+            data.size
+        };
+        border.damage_per_block = data.damage_per_block;
+        border.buffer = data.safe_zone;
+        border
+    }
+
+    pub fn snapshot(&self) -> WorldBorderData {
+        WorldBorderData {
+            center_x: self.center_x,
+            center_z: self.center_z,
+            damage_per_block: self.damage_per_block,
+            safe_zone: self.buffer,
+            warning_blocks: self.warning_blocks,
+            warning_time: self.warning_time,
+            size: self.old_diameter,
+            lerp_time: self.speed.max(0),
+            lerp_target: self.new_diameter,
+        }
+    }
+
+    pub fn tick(&mut self) {
+        if self.speed > 0 {
+            self.speed -= 1;
+            let progress = (self.lerp_duration - self.speed) as f64 / self.lerp_duration as f64;
+            self.old_diameter = self.lerp_from + progress * (self.new_diameter - self.lerp_from);
         }
     }
 
@@ -67,8 +113,13 @@ impl Worldborder {
     }
 
     pub fn set_diameter(&mut self, world: &World, diameter: f64, speed: Option<i64>) {
-        self.old_diameter = self.new_diameter;
         self.new_diameter = diameter;
+        self.speed = speed.unwrap_or(0).max(0);
+        self.lerp_duration = self.speed;
+        self.lerp_from = self.old_diameter;
+        if self.speed == 0 {
+            self.old_diameter = diameter;
+        }
 
         match speed {
             Some(speed) => {
@@ -100,12 +151,12 @@ impl Worldborder {
         world.broadcast_packet_all(&CSetBorderWarningDistance::new(self.warning_blocks.into()));
     }
 
-    pub const fn set_damage_buffer(&mut self, buffer: f32) {
-        self.buffer = buffer;
+    pub fn set_damage_buffer(&mut self, buffer: impl Into<f64>) {
+        self.buffer = buffer.into();
     }
 
-    pub const fn set_damage_per_block(&mut self, damage: f32) {
-        self.damage_per_block = damage;
+    pub fn set_damage_per_block(&mut self, damage: impl Into<f64>) {
+        self.damage_per_block = damage.into();
     }
 
     pub fn reset(&mut self, world: &World) {
@@ -114,9 +165,11 @@ impl Worldborder {
         self.old_diameter = 29_999_984.0;
         self.new_diameter = 29_999_984.0;
         self.speed = 0;
+        self.lerp_duration = 0;
+        self.lerp_from = self.old_diameter;
         self.portal_teleport_boundary = 29_999_984;
         self.warning_blocks = 5;
-        self.warning_time = 15;
+        self.warning_time = 300;
         self.damage_per_block = 0.2;
         self.buffer = 5.0;
 
@@ -134,7 +187,7 @@ impl Worldborder {
 
     #[must_use]
     pub fn contains(&self, x: f64, z: f64) -> bool {
-        let half = self.new_diameter / 2.0;
+        let half = self.old_diameter / 2.0;
         let min_x = self.center_x - half;
         let max_x = self.center_x + half;
         let min_z = self.center_z - half;
@@ -150,7 +203,7 @@ impl Worldborder {
 
     #[must_use]
     pub fn clamp_block(&self, x: i32, z: i32) -> (i32, i32) {
-        let half = self.new_diameter / 2.0;
+        let half = self.old_diameter / 2.0;
         // A border narrower than one block spans no block boundary, leaving `max`
         // below `min`. `Ord::clamp` panics on an inverted range, so collapse the
         // range onto the single block that holds the centre instead.
@@ -165,6 +218,35 @@ impl Worldborder {
 #[cfg(test)]
 mod tests {
     use super::Worldborder;
+
+    #[test]
+    fn moving_border_snapshot_resumes_with_remaining_ticks() {
+        let mut border =
+            Worldborder::from_saved(&pumpkin_world::world_info::data_files::WorldBorderData {
+                center_x: -42.0,
+                center_z: 7.0,
+                damage_per_block: 0.2,
+                safe_zone: 5.0,
+                warning_blocks: 5,
+                warning_time: 300,
+                size: 100.0,
+                lerp_time: 80,
+                lerp_target: 500.0,
+            });
+        for _ in 0..20 {
+            border.tick();
+        }
+        let snapshot = border.snapshot();
+        assert_eq!(snapshot.size, 200.0);
+        assert_eq!(snapshot.lerp_time, 60);
+        assert_eq!(snapshot.damage_per_block, 0.2);
+        let mut resumed = Worldborder::from_saved(&snapshot);
+        for _ in 0..60 {
+            resumed.tick();
+        }
+        assert_eq!(resumed.snapshot().size, 500.0);
+        assert_eq!(resumed.snapshot().lerp_time, 0);
+    }
 
     fn centered_border(diameter: f64) -> Worldborder {
         Worldborder::new(0.0, 0.0, diameter, 0, 5, 300)

@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 /// POI type identifier for nether portals
 pub const POI_TYPE_NETHER_PORTAL: &str = "minecraft:nether_portal";
 
-const DATA_VERSION: i32 = 5023;
+use crate::world_info::CURRENT_WORLD_DATA_VERSION as DATA_VERSION;
 
 /// A single Point of Interest entry (serializable)
 #[derive(Debug, Clone, Serialize, Deserialize)]
