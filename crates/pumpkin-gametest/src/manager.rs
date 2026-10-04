@@ -70,10 +70,38 @@ impl GameTestBatchReport {
         }
     }
 
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.remaining_tests.load(Ordering::Acquire) == 0
+    }
+
+    #[must_use]
+    pub fn total_runs(&self) -> usize {
+        self.total_runs.load(Ordering::Acquire)
+    }
+
+    #[must_use]
+    pub fn failed_required(&self) -> usize {
+        self.failed_required.load(Ordering::Acquire)
+    }
+
+    #[must_use]
+    pub fn failed_optional(&self) -> usize {
+        self.failed_optional.load(Ordering::Acquire)
+    }
+
     pub fn fail_to_start(&self, error: &GameTestError) {
         self.reporter
             .send_message(TextComponent::text(error.to_string()).color_named(NamedColor::Red));
         self.finish_test(true, 1, 0);
+    }
+
+    /// Counts a test removed by `/test stop` as finished without adding a failure.
+    pub fn stop_test(&self, test_id: &str) {
+        self.reporter.send_message(
+            TextComponent::text(format!("{test_id} was stopped")).color_named(NamedColor::Yellow),
+        );
+        self.finish_test(true, 0, 0);
     }
 
     fn finish_test(&self, required: bool, attempts: u32, successes: u32) {
@@ -363,6 +391,32 @@ impl GameTestRunner {
 
     pub fn clear(&mut self) {
         self.active.clear();
+    }
+
+    /// Stops every unfinished test and settles its batch report, then empties the runner.
+    pub async fn stop_all(&mut self) {
+        for managed in &mut self.active {
+            if managed.done {
+                continue;
+            }
+            managed.run.stop().await;
+            managed.report.finish_test(
+                managed.run.test.is_required(),
+                managed.attempts,
+                managed.successes,
+            );
+            managed.sink.send_message(
+                TextComponent::text(format!("{} was stopped", managed.run.test.id()))
+                    .color_named(NamedColor::Yellow),
+            );
+            managed.done = true;
+        }
+        self.active.clear();
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.active.is_empty()
     }
 
     pub async fn tick(&mut self) {

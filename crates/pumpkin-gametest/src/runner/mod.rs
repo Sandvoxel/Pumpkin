@@ -35,8 +35,12 @@ pub struct GameTestSession {
     test_y: Option<i32>,
     test_z: i32,
     chunks_loaded: bool,
+    chunk_wait_ticks: u32,
     started_at: Option<Instant>,
 }
+
+/// Vanilla waits indefinitely; a bound turns a never-loading test area into a failure.
+pub const MAX_CHUNK_LOAD_WAIT_TICKS: u32 = 20 * 60;
 
 impl GameTestSession {
     #[must_use]
@@ -79,6 +83,7 @@ impl GameTestSession {
             test_y: None,
             test_z,
             chunks_loaded: false,
+            chunk_wait_ticks: 0,
             started_at: None,
         }
     }
@@ -102,6 +107,7 @@ impl GameTestSession {
             test_y: self.test_y,
             test_z: self.test_z,
             chunks_loaded: false,
+            chunk_wait_ticks: 0,
             started_at: None,
         }
     }
@@ -145,19 +151,20 @@ impl GameTestSession {
 
         match placement {
             Ok(placement) => {
-                if let Err(error) = encase_structure(
+                self.test_y = Some(placement.test_instance_pos().0.y);
+                let encased = encase_structure(
                     self.world.as_ref(),
                     &placement,
                     self.test.definition().sky_access,
                 )
-                .await
-                {
+                .await;
+                // Stored before reporting so an encase failure still marks the controller.
+                self.placement = Some(placement);
+                if let Err(error) = encased {
                     self.finish_failure(0, error, None).await;
                     return;
                 }
 
-                self.test_y = Some(placement.test_instance_pos().0.y);
-                self.placement = Some(placement);
                 // Vanilla's StructureSpawner calls startExecution(1), so even a test
                 // with zero setup ticks waits until the next server tick to start.
                 self.state = GameTestState::SettingUp { elapsed_ticks: 0 };
@@ -190,6 +197,14 @@ impl GameTestSession {
                 origin.0.z + size[2],
             );
             if !self.world.test_area_loaded_and_ticking(origin, &max).await {
+                self.chunk_wait_ticks = self.chunk_wait_ticks.saturating_add(1);
+                if self.chunk_wait_ticks > MAX_CHUNK_LOAD_WAIT_TICKS {
+                    let error = GameTestError::ChunkLoadTimeout {
+                        waited_ticks: MAX_CHUNK_LOAD_WAIT_TICKS,
+                    };
+                    self.finish_failure(0, error, None).await;
+                    return;
+                }
                 self.state = GameTestState::SettingUp { elapsed_ticks };
                 return;
             }
@@ -379,6 +394,28 @@ impl GameTestSession {
         self.state = GameTestState::Failed { tick, error };
     }
 
+    /// Ends an unfinished run as [`GameTestError::Stopped`], removing its barrier shell.
+    /// World cleanup is best-effort: a stop must always end the run.
+    pub(crate) async fn stop(&mut self) {
+        if self.state.is_finished() {
+            return;
+        }
+        let error = GameTestError::Stopped;
+        if let Some(placement) = &self.placement {
+            let _ = remove_barriers(
+                self.world.as_ref(),
+                placement,
+                self.test.definition().sky_access,
+            )
+            .await;
+            let _ = self
+                .world
+                .set_test_instance_failure(placement.test_instance_pos(), &error.to_string(), None)
+                .await;
+        }
+        self.state = GameTestState::Failed { tick: 0, error };
+    }
+
     fn test_block_positions(&self, mode: TestBlockMode) -> Vec<BlockPos> {
         let Some(placement) = &self.placement else {
             return Vec::new();
@@ -438,5 +475,131 @@ impl TestRunner {
 
     pub fn active_mut(&mut self) -> &mut [GameTestSession] {
         &mut self.active
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "tests fail by panicking")]
+mod tests {
+    use pumpkin_data::Block;
+    use serde_json::json;
+
+    use super::*;
+    use crate::model::GameTestDefinition;
+    use crate::structure::GameTestStructureBlock;
+    use crate::testing::{ControllerStatus, MemoryGameTestWorld};
+
+    const ACCEPT_POS: [i32; 3] = [0, 0, 1];
+
+    fn test_block(position: [i32; 3], mode: TestBlockMode) -> GameTestStructureBlock {
+        GameTestStructureBlock {
+            position,
+            state: Block::TEST_BLOCK.default_state.id,
+            nbt: None,
+            test_mode: Some(mode),
+        }
+    }
+
+    fn start_accept_session(world: Arc<MemoryGameTestWorld>) -> GameTestSession {
+        let definition: GameTestDefinition = serde_json::from_value(json!({
+            "type": "minecraft:block_based",
+            "environment": "minecraft:default",
+            "structure": "test:start_accept",
+            "max_ticks": 20,
+        }))
+        .expect("valid definition");
+        let template = GameTestStructureTemplate::new(
+            [1, 1, 2],
+            vec![
+                test_block([0, 0, 0], TestBlockMode::Start),
+                test_block(ACCEPT_POS, TestBlockMode::Accept),
+            ],
+        );
+        GameTestSession::new(
+            BlockBasedTest::new("test:start_accept", definition),
+            world,
+            Arc::new(template),
+            0,
+            0,
+        )
+    }
+
+    fn controller_pos(session: &GameTestSession) -> BlockPos {
+        *session
+            .placement
+            .as_ref()
+            .expect("structure placed")
+            .test_instance_pos()
+    }
+
+    #[tokio::test]
+    async fn passes_when_accept_block_triggers() {
+        let world = Arc::new(MemoryGameTestWorld::default());
+        let mut session = start_accept_session(world.clone());
+
+        session.tick().await;
+        session.tick().await;
+        assert!(matches!(session.state, GameTestState::Running { .. }));
+
+        let accept = session
+            .placement
+            .as_ref()
+            .expect("structure placed")
+            .transform(&BlockPos::new(ACCEPT_POS[0], ACCEPT_POS[1], ACCEPT_POS[2]));
+        world.press_test_block(accept);
+        session.tick().await;
+
+        assert!(matches!(session.state, GameTestState::Passed { .. }));
+        assert_eq!(
+            world.controller_status(&controller_pos(&session)),
+            Some(ControllerStatus::Passed)
+        );
+    }
+
+    #[tokio::test]
+    async fn encase_failure_marks_controller_failed() {
+        let world = Arc::new(MemoryGameTestWorld::default());
+        world.reject_placing(Block::BARRIER.default_state.id);
+        let mut session = start_accept_session(world.clone());
+
+        session.tick().await;
+
+        assert!(matches!(
+            session.state,
+            GameTestState::Failed {
+                error: GameTestError::World(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            world.controller_status(&controller_pos(&session)),
+            Some(ControllerStatus::Failed(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn setup_times_out_when_test_area_never_loads() {
+        let world = Arc::new(MemoryGameTestWorld::default());
+        world.set_area_loaded(false);
+        let mut session = start_accept_session(world.clone());
+
+        session.tick().await;
+        for _ in 0..MAX_CHUNK_LOAD_WAIT_TICKS {
+            session.tick().await;
+            assert!(matches!(session.state, GameTestState::SettingUp { .. }));
+        }
+        session.tick().await;
+
+        assert!(matches!(
+            session.state,
+            GameTestState::Failed {
+                error: GameTestError::ChunkLoadTimeout { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            world.controller_status(&controller_pos(&session)),
+            Some(ControllerStatus::Failed(_))
+        ));
     }
 }

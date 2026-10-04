@@ -1,4 +1,4 @@
-use super::server_test_manager::drain_game_test_queue;
+use super::server_test_manager::tick_game_tests;
 
 use crate::{
     STOP_INTERRUPT,
@@ -112,10 +112,9 @@ impl Ticker {
             }
 
             if should_tick_game_tests {
-                server.runtime.block_on(async {
-                    drain_game_test_queue(server, &mut game_test_runner).await;
-                    game_test_runner.tick().await;
-                });
+                server
+                    .runtime
+                    .block_on(tick_game_tests(server, &mut game_test_runner));
             }
 
             let tick_duration_nanos = elapsed_nanos(base) - tick_start_nanos;

@@ -14,7 +14,6 @@ use pumpkin_nbt::NbtCompound;
 use pumpkin_util::math::{position::BlockPos, vector2::Vector2};
 use pumpkin_util::text::TextComponent;
 use pumpkin_world::{chunk::ChunkHeightmapType, world::BlockFlags};
-use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::{
@@ -26,8 +25,7 @@ use crate::{
     world::World,
 };
 
-static GAME_TEST_QUEUE: LazyLock<Mutex<Vec<GameTestQueueEntry>>> =
-    LazyLock::new(|| Mutex::new(Vec::new()));
+static GAME_TEST_QUEUE: StdMutex<Vec<GameTestQueueEntry>> = StdMutex::new(Vec::new());
 static STOP_GAME_TESTS: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy)]
@@ -58,6 +56,7 @@ pub struct GameTestQueueEntry {
     rotation_steps: i32,
     retry_options: GameTestRetryOptions,
     report: Arc<GameTestBatchReport>,
+    per_test_reporter: Option<Arc<dyn GameTestReporter>>,
 }
 
 impl GameTestQueueEntry {
@@ -79,7 +78,16 @@ impl GameTestQueueEntry {
             rotation_steps,
             retry_options,
             report,
+            per_test_reporter: None,
         }
+    }
+
+    /// Sends per-test pass/fail messages to `reporter` instead of broadcasting them
+    /// to the world's players.
+    #[must_use]
+    pub fn with_per_test_reporter(mut self, reporter: Arc<dyn GameTestReporter>) -> Self {
+        self.per_test_reporter = Some(reporter);
+        self
     }
 }
 
@@ -93,30 +101,48 @@ impl GameTestReporter for GameTestWorldReporter {
     }
 }
 
-pub async fn enqueue_game_test(request: GameTestQueueEntry) {
-    GAME_TEST_QUEUE.lock().await.push(request);
+fn lock_queue() -> std::sync::MutexGuard<'static, Vec<GameTestQueueEntry>> {
+    GAME_TEST_QUEUE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-pub async fn stop_game_tests() {
+pub fn enqueue_game_test(request: GameTestQueueEntry) {
+    lock_queue().push(request);
+}
+
+pub fn stop_game_tests() {
     // Keep the queue mutex held while publishing the stop request. drain_game_test_queue
     // takes the same mutex before consuming STOP_GAME_TESTS, so a stop+new-run command
     // cannot race between the runner-clear and queue-drain phases.
-    let mut queue = GAME_TEST_QUEUE.lock().await;
-    queue.clear();
+    let mut queue = lock_queue();
+    for request in queue.drain(..) {
+        request.report.stop_test(&request.test_id);
+    }
     STOP_GAME_TESTS.store(true, Ordering::Release);
 }
 
-pub(super) async fn drain_game_test_queue(server: &Arc<Server>, runner: &mut GameTestRunner) {
-    // Hold the same queue mutex used by stop_game_tests while consuming the stop
-    // flag and draining requests. This closes the async race where a new /test run
-    // could otherwise be drained before the old runner was cleared.
-    let queued = {
-        let mut queue = GAME_TEST_QUEUE.lock().await;
-        if STOP_GAME_TESTS.swap(false, Ordering::AcqRel) {
-            runner.clear();
-        }
-        std::mem::take(&mut *queue)
+/// Starts queued `GameTest`s and advances every active one by a single tick.
+///
+/// Call once per server tick, after [`Server::tick`].
+pub async fn tick_game_tests(server: &Arc<Server>, runner: &mut GameTestRunner) {
+    drain_game_test_queue(server, runner).await;
+    runner.tick().await;
+}
+
+async fn drain_game_test_queue(server: &Arc<Server>, runner: &mut GameTestRunner) {
+    // Consume the stop flag and the queue under one lock so a stop+new-run pair is
+    // applied in order: old runs stop before any newly queued run starts.
+    let (stop_requested, queued) = {
+        let mut queue = lock_queue();
+        (
+            STOP_GAME_TESTS.swap(false, Ordering::AcqRel),
+            std::mem::take(&mut *queue),
+        )
     };
+    if stop_requested {
+        runner.stop_all().await;
+    }
 
     for request in queued {
         let test_id = request.test_id.clone();
@@ -164,8 +190,10 @@ async fn prepare_test_run(
         .map_err(GameTestError::World)?;
     let template = GameTestStructureTemplate::from_nbt(&structure)?;
     let test = BlockBasedTest::new(request.test_id, test_instance);
-    let report_sink: Arc<dyn GameTestReporter> = Arc::new(GameTestWorldReporter {
-        world: request.world.clone(),
+    let report_sink = request.per_test_reporter.unwrap_or_else(|| {
+        Arc::new(GameTestWorldReporter {
+            world: request.world.clone(),
+        })
     });
     let adapter_world: Arc<dyn GameTestWorld> = Arc::new(ServerGameTestWorld {
         world: request.world,

@@ -8,6 +8,11 @@ pub(super) struct ActivePlayerArea {
     pub simulation_distance: i32,
 }
 
+pub(super) struct ForcedChunkChanges {
+    pub added: Vec<Vector2<i32>>,
+    pub removed: Vec<Vector2<i32>>,
+}
+
 #[derive(Default)]
 pub(super) struct ActiveChunkTracker {
     pub players: FxHashMap<Uuid, ActivePlayerArea>,
@@ -119,7 +124,7 @@ impl ActiveChunkTracker {
         forced_chunks: &FxHashSet<Vector2<i32>>,
         active_chunks: &mut FxHashSet<Vector2<i32>>,
         newly_active: &mut Vec<Vector2<i32>>,
-    ) {
+    ) -> ForcedChunkChanges {
         let removed: Vec<_> = self
             .forced_chunks
             .difference(forced_chunks)
@@ -129,13 +134,14 @@ impl ActiveChunkTracker {
             .difference(&self.forced_chunks)
             .copied()
             .collect();
-        for pos in removed {
+        for &pos in &removed {
             self.remove_chunk(pos, active_chunks);
         }
-        for pos in added {
+        for &pos in &added {
             self.add_chunk(pos, active_chunks, newly_active);
         }
         self.forced_chunks.clone_from(forced_chunks);
+        ForcedChunkChanges { added, removed }
     }
 }
 

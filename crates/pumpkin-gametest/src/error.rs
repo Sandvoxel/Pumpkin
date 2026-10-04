@@ -15,6 +15,12 @@ pub enum GameTestError {
     #[error("test exceeded its maximum of {max_ticks} ticks")]
     Timeout { max_ticks: u32 },
 
+    #[error("test area chunks were not loaded and ticking after {waited_ticks} ticks")]
+    ChunkLoadTimeout { waited_ticks: u32 },
+
+    #[error("test was stopped before it finished")]
+    Stopped,
+
     #[error(
         "test exhausted {attempts} attempts with {successes} successes; {required_successes} successes required: {last_error}"
     )]

@@ -775,13 +775,13 @@ impl MobEntity {
             })
             .fold(f64::MAX, f64::min);
 
-        // Mobs like a converting zombie villager refuse to despawn (`removeWhenFarAway`).
-        if !mob.remove_when_far_away(nearest_dist_sq) {
+        // Vanilla only despawns relative to a nearest player; with none online, mobs stay.
+        if nearest_dist_sq == f64::MAX {
             return;
         }
 
-        if nearest_dist_sq == f64::MAX {
-            mob.get_entity().remove();
+        // Mobs like a converting zombie villager refuse to despawn (`removeWhenFarAway`).
+        if !mob.remove_when_far_away(nearest_dist_sq) {
             return;
         }
 

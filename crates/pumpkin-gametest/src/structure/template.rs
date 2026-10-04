@@ -55,6 +55,11 @@ struct PaletteEntry {
 }
 
 impl GameTestStructureTemplate {
+    #[must_use]
+    pub const fn new(size: [i32; 3], blocks: Vec<GameTestStructureBlock>) -> Self {
+        Self { size, blocks }
+    }
+
     pub fn from_nbt(structure: &NbtCompound) -> GameTestResult<Self> {
         let size = read_vec3(structure, "size")?;
         if size.iter().any(|axis| *axis <= 0) {

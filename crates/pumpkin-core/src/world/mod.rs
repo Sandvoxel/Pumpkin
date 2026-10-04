@@ -483,7 +483,10 @@ impl World {
         for id in removed_players {
             tracker.remove_player(id, &mut active_chunks);
         }
-        tracker.sync_forced_chunks(&forced_chunks, &mut active_chunks, &mut newly_active);
+        let forced_changes =
+            tracker.sync_forced_chunks(&forced_chunks, &mut active_chunks, &mut newly_active);
+        self.level
+            .update_forced_chunks(&forced_changes.added, &forced_changes.removed);
 
         for pos in newly_active {
             if self.level.is_chunk_loaded(&pos) && tracker.loaded_active_chunks.insert(pos) {

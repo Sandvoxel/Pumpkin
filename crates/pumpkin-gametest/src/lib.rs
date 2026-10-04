@@ -5,6 +5,8 @@ pub mod manager;
 pub mod model;
 pub mod runner;
 pub mod structure;
+#[cfg(any(test, feature = "test-util"))]
+pub mod testing;
 pub mod world;
 
 pub use block_based::BlockBasedTest;

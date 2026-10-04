@@ -481,6 +481,42 @@ impl Level {
         !self.mark_chunks_as_not_watched([chunk]).await.is_empty()
     }
 
+    /// Keeps `added` chunks loaded at full status and counts them as watched, so neither
+    /// the chunk scheduler nor entity cleanup evicts them without a player nearby.
+    /// `removed` chunks drop that hold again.
+    pub fn update_forced_chunks(&self, added: &[Vector2<i32>], removed: &[Vector2<i32>]) {
+        if added.is_empty() && removed.is_empty() {
+            return;
+        }
+
+        for chunk in added {
+            self.chunk_watchers
+                .entry(*chunk)
+                .and_modify(|count| *count = count.saturating_add(1))
+                .or_insert(1);
+        }
+        for chunk in removed {
+            if let Entry::Occupied(mut entry) = self.chunk_watchers.entry(*chunk) {
+                *entry.get_mut() = entry.get().saturating_sub(1);
+                if *entry.get() == 0 {
+                    entry.remove();
+                }
+            }
+        }
+
+        let mut chunk_loading = self
+            .chunk_loading
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for chunk in added {
+            chunk_loading.add_force_ticket(*chunk);
+        }
+        for chunk in removed {
+            chunk_loading.remove_force_ticket(*chunk);
+        }
+        chunk_loading.send_change();
+    }
+
     // In Level::clean_entity_chunks()
     pub fn clean_entity_chunks(
         self: &Arc<Self>,
