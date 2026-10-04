@@ -379,7 +379,17 @@ impl World {
         let generation_settings = NoiseSettings::from_dimension(&dimension);
 
         // Load portal POI from disk (PoiStorage::new automatically loads from disk if files exist)
-        let portal_poi = portal::PortalPoiStorage::new(level.level_folder.poi_folder.clone());
+        let config = server
+            .upgrade()
+            .and_then(|server| match &server.advanced_config.world.chunk {
+                pumpkin_config::chunk::ChunkConfig::Anvil(config) => Some(config.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let portal_poi = portal::PortalPoiStorage::new_with_config(
+            level.level_folder.poi_folder.clone(),
+            config,
+        );
         let dragon_fight = (dimension.minecraft_name == Dimension::THE_END.minecraft_name)
             .then(|| std::sync::Mutex::new(dragon_fight::DragonFight::new()));
 

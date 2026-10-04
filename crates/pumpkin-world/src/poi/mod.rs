@@ -1,5 +1,5 @@
 use rustc_hash::FxHashMap;
-use std::io::{Cursor, Write};
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
@@ -7,8 +7,8 @@ use crate::chunk::{
     format::anvil::Compression as AnvilCompression,
     io::region::{AnvilRegion, RegionRecord},
 };
-use flate2::Compression;
-use flate2::write::ZlibEncoder;
+use pumpkin_config::chunk::AnvilChunkConfig;
+use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
 use pumpkin_util::math::position::BlockPos;
 use pumpkin_util::math::vector3::Vector3;
 use serde::{Deserialize, Serialize};
@@ -16,8 +16,7 @@ use serde::{Deserialize, Serialize};
 /// POI type identifier for nether portals
 pub const POI_TYPE_NETHER_PORTAL: &str = "minecraft:nether_portal";
 
-// Data version for 1.21
-const DATA_VERSION: i32 = 3955;
+const DATA_VERSION: i32 = 5023;
 
 /// A single Point of Interest entry (serializable)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +27,8 @@ pub struct PoiEntry {
     #[serde(rename = "type")]
     pub poi_type: String,
     pub free_tickets: i32,
+    #[serde(skip)]
+    retained: NbtCompound,
 }
 
 impl PoiEntry {
@@ -39,6 +40,7 @@ impl PoiEntry {
             z: pos.0.z,
             poi_type: POI_TYPE_NETHER_PORTAL.to_string(),
             free_tickets: 0,
+            retained: NbtCompound::new(),
         }
     }
 
@@ -49,22 +51,26 @@ impl PoiEntry {
 }
 
 /// POI section data (serializable) - vanilla format
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct PoiSectionData {
     #[serde(default)]
     pub valid: i8,
     #[serde(default)]
     pub records: Vec<PoiEntry>,
+    #[serde(skip)]
+    retained: NbtCompound,
 }
 
 /// POI chunk data (serializable) - vanilla format
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct PoiChunkData {
     pub data_version: i32,
     /// Sections keyed by Y section coordinate (e.g., "-1", "0", "1", "4")
     pub sections: FxHashMap<String, PoiSectionData>,
+    #[serde(skip)]
+    retained: NbtCompound,
 }
 
 /// POI data for a single region (32x32 chunks) using MCA format
@@ -77,6 +83,8 @@ pub struct PoiRegion {
     dirty: bool,
     transport: AnvilRegion,
     load_error: Option<String>,
+    record_errors: FxHashMap<usize, String>,
+    chunks: FxHashMap<usize, PoiChunkData>,
 }
 
 impl PoiRegion {
@@ -102,11 +110,14 @@ impl PoiRegion {
         section_y.to_string()
     }
 
-    pub fn add(&mut self, entry: PoiEntry) {
+    pub fn add(&mut self, mut entry: PoiEntry) {
         let chunk_x = entry.x >> 4;
         let chunk_z = entry.z >> 4;
         self.dirty_chunks.insert((chunk_x, chunk_z));
         let key = (entry.x, entry.y, entry.z);
+        if let Some(previous) = self.entries.get(&key) {
+            entry.retained.clone_from(&previous.retained);
+        }
         self.entries.insert(key, entry);
         self.dirty = true;
     }
@@ -138,153 +149,204 @@ impl PoiRegion {
         self.dirty_chunks.clear();
     }
 
-    /// Group entries by chunk, then create chunk NBT data
     fn get_chunk_data(&self, chunk_x: i32, chunk_z: i32) -> Option<PoiChunkData> {
-        let mut sections: FxHashMap<String, PoiSectionData> = FxHashMap::default();
-
-        for entry in self.entries.values() {
-            let entry_chunk_x = entry.x >> 4;
-            let entry_chunk_z = entry.z >> 4;
-
-            if entry_chunk_x != chunk_x || entry_chunk_z != chunk_z {
-                continue;
-            }
-
-            let section_key = Self::section_key(&entry.pos());
-            let section = sections
-                .entry(section_key)
+        let mut data = self
+            .chunks
+            .get(&Self::chunk_index(chunk_x, chunk_z))
+            .cloned()
+            .unwrap_or_default();
+        data.data_version = DATA_VERSION;
+        for section in data.sections.values_mut() {
+            section.records.clear();
+        }
+        for entry in self
+            .entries
+            .values()
+            .filter(|entry| entry.x >> 4 == chunk_x && entry.z >> 4 == chunk_z)
+        {
+            data.sections
+                .entry(Self::section_key(&entry.pos()))
                 .or_insert_with(|| PoiSectionData {
                     valid: 1,
-                    records: Vec::new(),
-                });
-            section.records.push(entry.clone());
+                    ..PoiSectionData::default()
+                })
+                .records
+                .push(entry.clone());
         }
-
-        if sections.is_empty() {
-            None
-        } else {
-            Some(PoiChunkData {
-                data_version: DATA_VERSION,
-                sections,
-            })
-        }
+        (!data.sections.is_empty() || !data.retained.is_empty()).then_some(data)
     }
 
-    /// Compress chunk data to bytes
-    fn compress_chunk_data(chunk_data: &PoiChunkData) -> std::io::Result<Vec<u8>> {
-        let mut root = pumpkin_nbt::compound::NbtCompound::new();
-        root.put_int("DataVersion", chunk_data.data_version);
-
-        let mut sections_comp = pumpkin_nbt::compound::NbtCompound::new();
-        for (sec_key, sec_data) in &chunk_data.sections {
-            let mut sec_comp = pumpkin_nbt::compound::NbtCompound::new();
-            sec_comp.put_byte("Valid", sec_data.valid);
-            let mut rec_list = Vec::new();
-            for rec in &sec_data.records {
-                let mut rec_comp = pumpkin_nbt::compound::NbtCompound::new();
-                rec_comp.put_int("x", rec.x);
-                rec_comp.put_int("y", rec.y);
-                rec_comp.put_int("z", rec.z);
-                rec_comp.put_string("type", rec.poi_type.clone());
-                rec_comp.put_int("free_tickets", rec.free_tickets);
-                rec_list.push(pumpkin_nbt::tag::NbtTag::Compound(rec_comp));
-            }
-            sec_comp.put_list("Records", rec_list);
-            sections_comp.put_compound(sec_key, sec_comp);
+    fn compress_chunk_data(
+        chunk_data: &PoiChunkData,
+        compression: u8,
+        level: u32,
+    ) -> std::io::Result<Vec<u8>> {
+        let mut root = chunk_data.retained.clone();
+        root.put_int("DataVersion", DATA_VERSION);
+        let mut sections = NbtCompound::new();
+        for (key, section) in &chunk_data.sections {
+            let mut section_nbt = section.retained.clone();
+            section_nbt.put_byte("Valid", section.valid);
+            let records = section
+                .records
+                .iter()
+                .map(|record| {
+                    let mut nbt = record.retained.clone();
+                    for key in ["x", "y", "z"] {
+                        nbt.child_tags.remove(key);
+                    }
+                    nbt.put("pos", NbtTag::IntArray(vec![record.x, record.y, record.z]));
+                    nbt.put_string("type", record.poi_type.clone());
+                    nbt.put_int("free_tickets", record.free_tickets);
+                    NbtTag::Compound(nbt)
+                })
+                .collect();
+            section_nbt.put_list("Records", records);
+            sections.put_compound(key, section_nbt);
         }
-        root.put_compound("Sections", sections_comp);
-
-        let uncompressed = pumpkin_nbt::Nbt::from(root).write();
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(&uncompressed)?;
-        encoder.finish()
+        root.put_compound("Sections", sections);
+        let bytes = pumpkin_nbt::Nbt::from(root).write();
+        AnvilCompression::from_byte(compression)
+            .map_err(|()| std::io::Error::other("Unknown POI compression"))?
+            .map_or_else(
+                || Ok(bytes.to_vec()),
+                |compression| {
+                    compression
+                        .compress_data(&bytes, level)
+                        .map_err(|error| std::io::Error::other(error.to_string()))
+                },
+            )
     }
 
-    /// Decompress chunk data from bytes
     fn decompress_chunk_data(compressed: &[u8], compression: u8) -> std::io::Result<PoiChunkData> {
-        let compression = AnvilCompression::from_byte(compression)
-            .map_err(|()| std::io::Error::other("Unknown POI compression"))?;
-        let uncompressed = if let Some(compression) = compression {
-            compression
+        let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid POI NBT");
+        let compression = AnvilCompression::from_byte(compression).map_err(|()| invalid())?;
+        let bytes = match compression {
+            Some(compression) => compression
                 .decompress_data(compressed)
                 .map_err(|error| std::io::Error::other(error.to_string()))?
-                .into_vec()
-        } else {
-            compressed.to_vec()
+                .into_vec(),
+            None => compressed.to_vec(),
         };
-
-        let mut cursor = Cursor::new(uncompressed);
+        let mut cursor = Cursor::new(bytes);
         let mut reader = pumpkin_nbt::deserializer::NbtReadHelperJava::new(
             pumpkin_nbt::deserializer::NbtStreamReader(&mut cursor),
         );
-        let nbt = pumpkin_nbt::Nbt::read(&mut reader)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-
-        let data_version = nbt.get_int("DataVersion").unwrap_or(DATA_VERSION);
+        let root = pumpkin_nbt::Nbt::read(&mut reader)
+            .map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+            })?
+            .root_tag;
         let mut sections = FxHashMap::default();
-
-        if let Some(sec_tag) = nbt.get_compound("Sections") {
-            for (sec_key, tag) in &sec_tag.child_tags {
-                if let pumpkin_nbt::tag::NbtTag::Compound(sec_comp) = tag {
-                    let valid = sec_comp.get_byte("Valid").unwrap_or(1);
-                    let mut records = Vec::new();
-                    if let Some(pumpkin_nbt::tag::NbtTag::List(rec_list)) = sec_comp.get("Records")
-                    {
-                        for rec_t in rec_list {
-                            if let pumpkin_nbt::tag::NbtTag::Compound(rc) = rec_t {
-                                records.push(PoiEntry {
-                                    x: rc.get_int("x").unwrap_or(0),
-                                    y: rc.get_int("y").unwrap_or(0),
-                                    z: rc.get_int("z").unwrap_or(0),
-                                    poi_type: rc
-                                        .get_string("type")
-                                        .unwrap_or(POI_TYPE_NETHER_PORTAL)
-                                        .to_string(),
-                                    free_tickets: rc.get_int("free_tickets").unwrap_or(0),
-                                });
-                            }
-                        }
-                    }
-                    sections.insert(sec_key.to_string(), PoiSectionData { valid, records });
+        if let Some(tag) = root.get("Sections") {
+            let NbtTag::Compound(section_tags) = tag else {
+                return Err(invalid());
+            };
+            for (key, tag) in &section_tags.child_tags {
+                let NbtTag::Compound(section) = tag else {
+                    return Err(invalid());
+                };
+                key.parse::<i32>().map_err(|_| invalid())?;
+                let records = section.get_list("Records").ok_or_else(invalid)?;
+                let mut entries = Vec::new();
+                for tag in records {
+                    let NbtTag::Compound(record) = tag else {
+                        return Err(invalid());
+                    };
+                    let pos = match record.get("pos") {
+                        Some(NbtTag::IntArray(pos)) if pos.len() == 3 => [pos[0], pos[1], pos[2]],
+                        Some(_) => return Err(invalid()),
+                        None => [
+                            record.get_int("x").ok_or_else(invalid)?,
+                            record.get_int("y").ok_or_else(invalid)?,
+                            record.get_int("z").ok_or_else(invalid)?,
+                        ],
+                    };
+                    entries.push(PoiEntry {
+                        x: pos[0],
+                        y: pos[1],
+                        z: pos[2],
+                        poi_type: record.get_string("type").ok_or_else(invalid)?.to_string(),
+                        free_tickets: match record.get("free_tickets") {
+                            None => 0,
+                            Some(NbtTag::Int(value)) => *value,
+                            Some(_) => return Err(invalid()),
+                        },
+                        retained: record.clone(),
+                    });
                 }
+                sections.insert(
+                    key.to_string(),
+                    PoiSectionData {
+                        valid: section.get_byte("Valid").unwrap_or(0),
+                        records: entries,
+                        retained: section.clone(),
+                    },
+                );
             }
         }
-
         Ok(PoiChunkData {
-            data_version,
+            data_version: root.get_int("DataVersion").unwrap_or(DATA_VERSION),
             sections,
+            retained: root,
         })
     }
 
     pub fn save(&mut self, path: &Path) -> std::io::Result<()> {
+        self.save_with_config(path, &AnvilChunkConfig::default())
+    }
+
+    fn save_with_config(&mut self, path: &Path, config: &AnvilChunkConfig) -> std::io::Result<()> {
         if let Some(error) = &self.load_error {
             return Err(std::io::Error::other(error.clone()));
         }
         if !self.dirty {
-            return Ok(());
+            return self
+                .record_errors
+                .values()
+                .next()
+                .map_or(Ok(()), |error| Err(std::io::Error::other(error.clone())));
         }
         let mut transport = self.transport.clone();
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |duration| duration.as_secs() as u32);
+        let mut applied = Vec::new();
+        let mut first_error = self
+            .record_errors
+            .values()
+            .next()
+            .map(|error| std::io::Error::other(error.clone()));
         for &(x, z) in &self.dirty_chunks {
             let index = Self::chunk_index(x, z);
+            let compression = transport.records[index].as_ref().map_or(
+                AnvilCompression::from(config.compression.algorithm) as u8,
+                |record| record.compression,
+            );
             let record = self
                 .get_chunk_data(x, z)
                 .map(|data| {
-                    Self::compress_chunk_data(&data)
-                        .map(|payload| RegionRecord::new(2, payload.into(), timestamp))
+                    Self::compress_chunk_data(&data, compression, config.compression.level)
+                        .map(|payload| RegionRecord::new(compression, payload.into(), timestamp))
                 })
                 .transpose()?;
-            transport.set(index, record)?;
+            match transport.set(index, record) {
+                Ok(()) => applied.push((x, z)),
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
         }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        transport.write(path, false)?;
+        transport.write(path, config.write_in_place)?;
         self.transport = transport;
-        self.mark_clean();
-        Ok(())
+        for pos in applied {
+            self.dirty_chunks.remove(&pos);
+        }
+        self.dirty = !self.dirty_chunks.is_empty();
+        first_error.map_or(Ok(()), Err)
     }
 
     pub fn load(path: &Path) -> std::io::Result<Self> {
@@ -303,15 +365,19 @@ impl PoiRegion {
             );
             match data {
                 Ok(data) => {
-                    for section in data.sections.into_values() {
-                        for entry in section.records {
-                            region.entries.insert((entry.x, entry.y, entry.z), entry);
+                    for section in data.sections.values() {
+                        for entry in &section.records {
+                            region
+                                .entries
+                                .insert((entry.x, entry.y, entry.z), entry.clone());
                         }
                     }
+                    region.chunks.insert(index, data);
                 }
                 Err(error) => {
                     warn!("Failed to parse POI chunk at index {index}: {error}");
                     region.transport.blocked.insert(index);
+                    region.record_errors.insert(index, error.to_string());
                 }
             }
         }
@@ -326,6 +392,7 @@ pub struct PoiStorage {
     folder: PathBuf,
     /// Loaded regions, keyed by (`region_x`, `region_z`)
     regions: FxHashMap<(i32, i32), PoiRegion>,
+    config: AnvilChunkConfig,
 }
 
 impl PoiStorage {
@@ -334,6 +401,16 @@ impl PoiStorage {
         Self {
             folder: poi_folder,
             regions: FxHashMap::default(),
+            config: AnvilChunkConfig::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn new_with_config(poi_folder: PathBuf, config: AnvilChunkConfig) -> Self {
+        Self {
+            folder: poi_folder,
+            regions: FxHashMap::default(),
+            config,
         }
     }
 
@@ -375,6 +452,7 @@ impl PoiStorage {
             z: pos.0.z,
             poi_type: poi_type.to_string(),
             free_tickets,
+            retained: NbtCompound::new(),
         });
     }
 
@@ -480,23 +558,32 @@ impl PoiStorage {
         std::fs::create_dir_all(&self.folder)?;
 
         let mut saved = 0;
+        let mut first_error = None;
         for ((rx, rz), region) in &mut self.regions {
-            if region.is_dirty() {
+            if region.is_dirty() || region.load_error.is_some() || !region.record_errors.is_empty()
+            {
                 let path = self.folder.join(format!("r.{rx}.{rz}.mca"));
-                region.save(&path)?;
-                saved += 1;
+                match region.save_with_config(&path, &self.config) {
+                    Ok(()) => saved += 1,
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
             }
         }
 
         if saved > 0 {
             info!("Saved {saved} POI region(s)");
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     pub fn synchronize(&self) -> std::io::Result<()> {
         for (&(x, z), region) in &self.regions {
-            region.transport.synchronize(&self.region_path(x, z))?;
+            let path = self.region_path(x, z);
+            if path.exists() {
+                region.transport.synchronize(&path)?;
+            }
         }
         Ok(())
     }
@@ -517,6 +604,80 @@ impl PoiStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vanilla_poi_and_unsupported_fields_survive_portal_changes() -> std::io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("r.-1.-1.mca");
+        let mut home = NbtCompound::new();
+        home.put("pos", NbtTag::IntArray(vec![-1, 64, -1]));
+        home.put_string("type", "minecraft:home".into());
+        home.put_int("free_tickets", 1);
+        home.put_string("example:record", "keep".into());
+        let mut section = NbtCompound::new();
+        section.put_bool("Valid", false);
+        section.put_string("example:section", "keep".into());
+        section.put_list("Records", vec![NbtTag::Compound(home.clone())]);
+        let mut sections = NbtCompound::new();
+        sections.put_compound("4", section);
+        let mut root = NbtCompound::new();
+        root.put_compound("Sections", sections);
+        root.put_string("example:root", "keep".into());
+        let mut transport = AnvilRegion::default();
+        transport.set(
+            1023,
+            Some(RegionRecord::new(
+                3,
+                pumpkin_nbt::Nbt::from(root).write(),
+                0,
+            )),
+        )?;
+        transport.write(&path, false)?;
+        let mut storage = PoiStorage::new(directory.path().to_path_buf());
+        storage.add_portal(BlockPos::new(-2, 65, -1));
+        storage.save_all()?;
+        let transport = AnvilRegion::load(&path)?;
+        let record = transport.records[1023].as_ref().unwrap();
+        assert_eq!(record.compression, 3);
+        let data = PoiRegion::decompress_chunk_data(&record.payload, record.compression)?;
+        assert_eq!(data.retained.get_string("example:root"), Some("keep"));
+        let section = &data.sections["4"];
+        assert_eq!(section.valid, 0);
+        assert_eq!(section.retained.get_string("example:section"), Some("keep"));
+        let saved_home = section
+            .records
+            .iter()
+            .find(|entry| entry.poi_type == "minecraft:home")
+            .unwrap();
+        assert_eq!(saved_home.retained, home);
+        for entry in &section.records {
+            assert!(entry.retained.has("pos"));
+            assert!(!entry.retained.has("x"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unreadable_poi_survives_saving_other_chunks() -> std::io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("r.0.0.mca");
+        let payload = bytes::Bytes::from_static(b"invalid NBT");
+        let mut transport = AnvilRegion::default();
+        transport.set(0, Some(RegionRecord::new(3, payload.clone(), 0)))?;
+        transport.write(&path, false)?;
+        let mut storage = PoiStorage::new(directory.path().to_path_buf());
+        storage.add_portal(BlockPos::new(16, 64, 0));
+        assert!(storage.save_all().is_err());
+        let transport = AnvilRegion::load(&path)?;
+        assert_eq!(transport.records[0].as_ref().unwrap().payload, payload);
+        assert!(transport.records[1].is_some());
+        let damaged = vec![1u8; 8192];
+        std::fs::write(directory.path().join("r.1.0.mca"), &damaged)?;
+        storage.add_portal(BlockPos::new(512, 64, 0));
+        assert!(storage.save_all().is_err());
+        assert_eq!(std::fs::read(directory.path().join("r.1.0.mca"))?, damaged);
+        Ok(())
+    }
 
     #[test]
     fn poi_entry() {
