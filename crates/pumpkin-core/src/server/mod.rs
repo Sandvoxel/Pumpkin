@@ -746,11 +746,11 @@ impl Server {
             }
         }
         self.tasks.close();
-        debug!("Awaiting tasks for server");
+        info!("Waiting for server tasks to finish...");
         self.tasks.wait().await;
         debug!("Done awaiting tasks for server");
 
-        info!("Starting worlds");
+        info!("Stopping worlds");
         for world in self.worlds.load().iter() {
             world.shutdown().await;
         }

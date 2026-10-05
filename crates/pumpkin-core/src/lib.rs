@@ -541,7 +541,7 @@ impl PumpkinServer {
 
         self.server.shutdown().await;
 
-        info!("Completed save!");
+        info!("Shutdown complete.");
 
         if let Some((wrapper, _, _)) = LOGGER_IMPL.wait()
             && let Some(rl) = wrapper.take_readline()

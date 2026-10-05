@@ -2,7 +2,7 @@ use bytes::{Buf, BufMut, Bytes};
 use rustc_hash::FxHashSet;
 use std::{
     fs::{self, OpenOptions},
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{self, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -240,7 +240,7 @@ impl AnvilRegion {
         }
         let mut new_locations = self.locations.clone();
         if in_place && path.exists() {
-            let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+            let mut file = BufWriter::new(OpenOptions::new().read(true).write(true).open(path)?);
             let mut used = FxHashSet::default();
             used.extend(0..2);
             for location in &self.locations {
@@ -270,10 +270,12 @@ impl AnvilRegion {
             file.flush()?;
         } else {
             let temp = temporary_path(path);
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp)?;
+            let mut file = BufWriter::new(
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&temp)?,
+            );
             let result = (|| {
                 let mut offset = 2;
                 for (index, record) in self.records.iter().enumerate() {

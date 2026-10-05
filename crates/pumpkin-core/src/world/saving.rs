@@ -20,9 +20,10 @@ use std::{
         Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::Instant,
 };
 use tokio::sync::oneshot;
-use tracing::error;
+use tracing::{error, info};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SaveMode {
@@ -42,7 +43,7 @@ type Completion = oneshot::Sender<Result<u64, String>>;
 pub(super) struct SaveState {
     requests: Mutex<Vec<(SaveMode, Completion)>>,
     pending: Mutex<BTreeMap<u64, Arc<Snapshot>>>,
-    writer: tokio::sync::Mutex<()>,
+    writer: Arc<tokio::sync::Mutex<()>>,
     pub(super) autosave: AtomicBool,
     unload_requests: Mutex<FxHashSet<Vector2<i32>>>,
     unloaded_snapshots: Mutex<FxHashSet<Vector2<i32>>>,
@@ -302,6 +303,10 @@ impl World {
 
     /// Called after entity and block entity ticks have joined.
     pub(crate) fn process_save_requests(self: &Arc<Self>) {
+        // Capture at a later tick instead of accumulating snapshots behind disk I/O.
+        let Ok(writer) = self.save_state.writer.clone().try_lock_owned() else {
+            return;
+        };
         let requests = std::mem::take(
             &mut *self
                 .save_state
@@ -377,7 +382,8 @@ impl World {
         }
         let world = self.clone();
         self.level.spawn_task(async move {
-            if let Err(error) = world.persist_pending().await {
+            let _writer = writer;
+            if let Err(error) = world.persist_pending_locked().await {
                 error!("Failed saving world: {error}");
             }
         });
@@ -439,9 +445,24 @@ impl World {
 
     async fn persist_snapshot(&self, snapshot: &Snapshot) -> Result<(), String> {
         let mut errors = Vec::new();
+        let shutdown = snapshot.mode == SaveMode::Shutdown;
+        let dimension = self.dimension.minecraft_name;
+        let started = Instant::now();
+        if shutdown {
+            info!("Waiting for queued chunk writes in {dimension}...");
+        }
         if let Err(error) = self.level.fence_chunk_writes().await {
             errors.push(error);
         }
+        if shutdown {
+            info!(
+                "Writing {} chunks and {} entity chunks in {dimension} (queued writes took {}ms)...",
+                snapshot.terrain.len(),
+                snapshot.entities.len(),
+                started.elapsed().as_millis()
+            );
+        }
+        let started = Instant::now();
         if let Err(error) = self
             .level
             .chunk_saver
@@ -479,11 +500,31 @@ impl World {
         if let Err(error) = self.level.save_entity_chunks(entity_chunks).await {
             errors.push(error.to_string());
         }
+        if shutdown {
+            info!(
+                "Writing metadata in {dimension} (chunk writes took {}ms)...",
+                started.elapsed().as_millis()
+            );
+        }
+        let started = Instant::now();
         if let Err(error) = self.persist_world_data(snapshot).await {
             errors.push(error);
         }
+        if shutdown {
+            info!(
+                "Flushing saved chunks in {dimension} (metadata took {}ms)...",
+                started.elapsed().as_millis()
+            );
+        }
+        let started = Instant::now();
         if let Err(error) = self.level.flush_saves(snapshot.mode.synchronize()).await {
             errors.push(error.to_string());
+        }
+        if shutdown {
+            info!(
+                "Chunk flush in {dimension} took {}ms",
+                started.elapsed().as_millis()
+            );
         }
         let mut event = crate::plugin::api::events::world::world_save::WorldSaveEvent::new(
             format!("{:?}", self.dimension),
@@ -565,6 +606,11 @@ impl World {
 
     async fn persist_pending(&self) -> Result<(), String> {
         let _writer = self.save_state.writer.lock().await;
+        self.persist_pending_locked().await
+    }
+
+    // The caller holds save_state.writer for the entire write pass.
+    async fn persist_pending_locked(&self) -> Result<(), String> {
         let mut attempted = FxHashSet::default();
         let mut first_error = None;
         loop {
@@ -614,6 +660,9 @@ impl World {
     }
 
     pub(crate) async fn save_for_shutdown(&self) -> Result<(), String> {
+        let started = Instant::now();
+        let dimension = self.dimension.minecraft_name;
+        info!("Capturing shutdown snapshot for {dimension}...");
         let requests = std::mem::take(
             &mut *self
                 .save_state
@@ -626,12 +675,21 @@ impl World {
             None,
             requests.into_iter().map(|(_, sender)| sender).collect(),
         );
+        info!(
+            "Captured shutdown snapshot for {dimension} in {}ms; waiting for pending saves...",
+            started.elapsed().as_millis()
+        );
         self.save_state
             .pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(snapshot.generation, snapshot);
-        self.persist_pending().await
+        self.persist_pending().await?;
+        info!(
+            "Saved shutdown snapshot for {dimension} in {}ms",
+            started.elapsed().as_millis()
+        );
+        Ok(())
     }
 }
 
@@ -664,6 +722,63 @@ mod tests {
             panic!("saved chunk was not readable");
         };
         chunk
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn busy_writer_defers_snapshots_and_preserves_save_requests() {
+        use pumpkin_data::Block;
+        use pumpkin_util::math::position::BlockPos;
+        use pumpkin_world::chunk::ChunkData;
+
+        let folder = tempfile::tempdir().unwrap();
+        let level = Level::from_root_folder(
+            &pumpkin_config::world::LevelConfig::default(),
+            folder.path().to_path_buf(),
+            42,
+            Dimension::OVERWORLD,
+        );
+        let world = Arc::new(World::load(
+            level.clone(),
+            Arc::new(ArcSwap::from_pointee(LevelData::default(Seed(42)))),
+            Dimension::OVERWORLD,
+            crate::block::registry::default_registry(),
+            Weak::new(),
+        ));
+        let chunk = ChunkData::empty_sync(0, 0);
+        chunk.mark_dirty(true);
+        level
+            .loaded_chunks
+            .insert(Vector2::new(0, 0), chunk.clone());
+        let writer = world.save_state.writer.lock().await;
+        let (sender, receiver) = oneshot::channel();
+        world
+            .save_state
+            .requests
+            .lock()
+            .unwrap()
+            .push((SaveMode::Flush, sender));
+        for _ in 0..20 {
+            world.save_state.autosave.store(true, Ordering::Release);
+            world.process_save_requests();
+        }
+        let queued = world.save_state.pending.lock().unwrap().len();
+        let position = BlockPos::new(1, 64, 1);
+        level.set_block_state(&position, Block::STONE.default_state.id);
+        drop(writer);
+        world.process_save_requests();
+        receiver.await.unwrap().unwrap();
+        world.persist_pending().await.unwrap();
+        let saved = read_saved_chunk(&level.level_folder.region_folder.join("r.0.0.mca")).await;
+        level.shutdown().await;
+
+        assert_eq!(
+            queued, 0,
+            "busy writers must leave requests for a later tick"
+        );
+        assert_eq!(
+            saved.section.get_block_absolute_y(1, 64, 1),
+            Some(Block::STONE.default_state.id)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
