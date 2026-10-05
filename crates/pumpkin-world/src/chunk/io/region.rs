@@ -339,6 +339,7 @@ impl AnvilRegion {
                     .sync_all()?;
             }
         }
+        #[cfg(unix)]
         if let Some(parent) = path.parent() {
             fs::File::open(parent)?.sync_all()?;
         }

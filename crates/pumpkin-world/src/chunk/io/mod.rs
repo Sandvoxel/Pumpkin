@@ -150,6 +150,7 @@ pub trait ChunkSerializer: Send + Sync + Default + 'static {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
             }
+            #[cfg(unix)]
             if let Some(parent) = path.parent() {
                 tokio::fs::File::open(parent).await?.sync_all().await?;
             }

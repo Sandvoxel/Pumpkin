@@ -1,5 +1,5 @@
 use std::{
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::BufWriter,
     path::{Path, PathBuf},
 };
@@ -303,15 +303,18 @@ pub fn synchronize_world_info(level_folder: &Path) -> Result<(), WorldInfoError>
         "data/minecraft/weather.dat",
     ] {
         let path = level_folder.join(name);
-        match File::open(path) {
+        match OpenOptions::new().write(true).open(path) {
             Ok(file) => file.sync_all()?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
     }
-    File::open(minecraft_data_dir(level_folder))?.sync_all()?;
-    File::open(level_folder.join("data"))?.sync_all()?;
-    File::open(level_folder)?.sync_all()?;
+    #[cfg(unix)]
+    {
+        File::open(minecraft_data_dir(level_folder))?.sync_all()?;
+        File::open(level_folder.join("data"))?.sync_all()?;
+        File::open(level_folder)?.sync_all()?;
+    }
     Ok(())
 }
 
@@ -376,10 +379,16 @@ pub fn write_world_border(
     root.put_compound("data", data);
     write_saved_data(dimension_folder, "world_border.dat", root, false)?;
     if synchronize {
-        File::open(minecraft_data_dir(dimension_folder).join("world_border.dat"))?.sync_all()?;
-        File::open(minecraft_data_dir(dimension_folder))?.sync_all()?;
-        File::open(dimension_folder.join("data"))?.sync_all()?;
-        File::open(dimension_folder)?.sync_all()?;
+        OpenOptions::new()
+            .write(true)
+            .open(minecraft_data_dir(dimension_folder).join("world_border.dat"))?
+            .sync_all()?;
+        #[cfg(unix)]
+        {
+            File::open(minecraft_data_dir(dimension_folder))?.sync_all()?;
+            File::open(dimension_folder.join("data"))?.sync_all()?;
+            File::open(dimension_folder)?.sync_all()?;
+        }
     }
     Ok(())
 }
@@ -1022,6 +1031,7 @@ mod tests {
         write_world_clocks(folder.path(), &clocks).unwrap();
         write_weather(folder.path(), &weather).unwrap();
         write_world_border(folder.path(), &border, true).unwrap();
+        synchronize_world_info(folder.path()).unwrap();
         assert_eq!(read_world_clocks(folder.path()), clocks);
         assert_eq!(read_weather(folder.path()), weather);
         assert_eq!(read_world_border(folder.path()).unwrap().unwrap(), border);

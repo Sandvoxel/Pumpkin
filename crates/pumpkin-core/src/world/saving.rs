@@ -525,7 +525,11 @@ impl World {
                     )?;
                 }
                 if synchronize && path.exists() {
-                    std::fs::File::open(path)?.sync_all()?;
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(path)?
+                        .sync_all()?;
+                    #[cfg(unix)]
                     std::fs::File::open(&folder)?.sync_all()?;
                 }
                 write_world_border(&dimension_folder, &border, synchronize)
@@ -768,6 +772,7 @@ mod tests {
             weather.thunder_time = 1300;
             weather.raining = true;
         };
+        world.custom_data.lock().unwrap().put_int("marker", 42);
         let snapshot = world.capture_save(SaveMode::Autosave, None, Vec::new());
         world.level_time.lock().unwrap().set_time(18000);
         world.weather.lock().unwrap().rain_time = 2400;
