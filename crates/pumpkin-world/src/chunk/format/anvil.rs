@@ -137,6 +137,10 @@ impl Compression {
                 Ok(chunk_data)
             }
             Self::LZ4 => {
+                const MAGIC: &[u8; 8] = b"LZ4Block";
+                const HEADER_LENGTH: usize = 21;
+                const COMPRESSION_METHOD_RAW: u8 = 0x10;
+
                 let mut compressed_data = Vec::new();
                 let block_size = 1 << (Self::LZ4_COMPRESSION_LEVEL_BASE + compression_level);
                 let mut encoder = lz4_java_wrc::Lz4BlockOutput::with_context(
@@ -148,7 +152,13 @@ impl Compression {
                 encoder
                     .write_all(uncompressed_data)
                     .map_err(CompressionError::LZ4Error)?;
+                encoder.flush().map_err(CompressionError::LZ4Error)?;
                 drop(encoder);
+                // lz4-java-wrc only flushes payload blocks; mirror LZ4BlockOutputStream.finish().
+                let mut terminator = [0; HEADER_LENGTH];
+                terminator[..MAGIC.len()].copy_from_slice(MAGIC);
+                terminator[MAGIC.len()] = COMPRESSION_METHOD_RAW | compression_level as u8;
+                compressed_data.extend_from_slice(&terminator);
                 Ok(compressed_data)
             }
             Self::Custom => Err(CompressionError::UnknownCompression),
@@ -401,6 +411,24 @@ impl<S: SingleChunkDataSerializer> ChunkSerializer for AnvilChunkFile<S> {
 mod tests {
     use super::*;
     use crate::chunk::io::region::RegionRecord;
+
+    #[test]
+    fn lz4_stream_matches_java_finish() -> Result<(), Box<dyn std::error::Error>> {
+        // Generated with Minecraft 26.3's bundled lz4-java 1.10.1.
+        let fixtures: &[(u32, &[u8], &[u8])] = &[
+            (0, b"", b"LZ4Block\x10\0\0\0\0\0\0\0\0\0\0\0\0"),
+            (
+                6,
+                b"Pumpkin",
+                b"LZ4Block\x16\x07\0\0\0\x07\0\0\0\x56\x38\xc9\x09PumpkinLZ4Block\x16\0\0\0\0\0\0\0\0\0\0\0\0",
+            ),
+            (15, b"", b"LZ4Block\x1f\0\0\0\0\0\0\0\0\0\0\0\0"),
+        ];
+        for &(level, input, expected) in fixtures {
+            assert_eq!(Compression::LZ4.compress_data(input, level)?, expected);
+        }
+        Ok(())
+    }
 
     struct RawChunk(Bytes);
     impl Dirtiable for RawChunk {
